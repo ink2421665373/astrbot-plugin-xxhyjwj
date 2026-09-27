@@ -146,7 +146,7 @@ class _ReadResult:
     reason: str = ""                  # 失败原因，可直接展示
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.5.0")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.5.1")
 class NarakaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -207,6 +207,15 @@ class NarakaPlugin(Star):
 
     def _auto_bind(self) -> bool:
         return bool(self.config.get("auto_bind", True)) and self.data_mode in LOGIN_MODES
+
+    def _detail_query_mode(self) -> str:
+        """兼容旧版布尔开关及新版三档配置。"""
+        value = self.config.get("enable_detail_query", "全部开启")
+        if value is False or value == "全部关闭":
+            return "全部关闭"
+        if value == "仅战绩查询":
+            return "仅战绩查询"
+        return "全部开启"
 
     def _refresh_enabled(self) -> bool:
         return bool(self.config.get("refresh_before_query", True))
@@ -887,6 +896,7 @@ class NarakaPlugin(Star):
 
     async def _run_read(self, player: str, mode: str, detailed: bool) -> _ReadResult:
         """只读查询：定位角色 → 更新 → 取列表 → 取详情 → 出报告。"""
+        detail_mode = self._detail_query_mode()
         async with self._session() as session:
             selected, reason = await self._resolve_player(session, player)
             if selected is None:
@@ -931,12 +941,14 @@ class NarakaPlugin(Star):
                     reason=f"查询到对局 {len(rows)} 场；其中没有{MODES[mode_id]}对局。",
                 )
 
-            detail_enabled = self.config.get("enable_detail_query", True)
+            detail_enabled = detail_mode == "全部开启" or (
+                detail_mode == "仅战绩查询" and not detailed
+            )
             records = []
             failures = 0
             stopped = False
             if not detail_enabled:
-                # 详情开关关闭：不调单局详情接口，用空 detail 只展示列表级数据
+                # 当前查询不请求单局详情，只展示列表级数据
                 for row in matches:
                     records.append(make_record(row, {}))
             else:
@@ -990,14 +1002,9 @@ class NarakaPlugin(Star):
 
         hero_names = apply_hero_mappings(hero_names, records, self.config.get("hero_mappings", []))
         total = len(rows)
-        if detailed and not self.config.get("enable_detail_query", True):
-            return _ReadResult(
-                ok=False, role_id=role_id, server=server, nickname=name,
-                reason="单局详情查询已在插件配置中关闭。",
-            )
         if detailed:
             report = format_details(name, total, mode_id, len(matches), records, hero_names,
-                                    failures, role_id=role_id)
+                                    failures, role_id=role_id, list_only=not detail_enabled)
             texts = split_detail_report(report)
         else:
             report = format_summary(name, total, mode_id, len(matches), records, scores,

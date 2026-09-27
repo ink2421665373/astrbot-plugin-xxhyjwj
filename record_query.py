@@ -304,7 +304,7 @@ def format_summary(player_name: str, total: int, mode_id: str, selected: int,
 
 def format_details(player_name: str, total: int, mode_id: str,
                    selected: int, records: list[dict], hero_names: dict[str, str],
-                   failed: int = 0, role_id: object = "") -> str:
+                   failed: int = 0, role_id: object = "", list_only: bool = False) -> str:
     label = MODES.get(mode_id, f"模式 {mode_id}")
     lines = [*format_identity(player_name, role_id),
              f"查询到对局 {total} 场｜模式：{label}",
@@ -313,7 +313,7 @@ def format_details(player_name: str, total: int, mode_id: str,
         lines.append(f"详情未成功 {failed} 场")
     if not records:
         return "\n".join(lines + ["暂无可展示的单局详情。"])
-    lines.append("有效对局详情（新→旧）：")
+    lines.append("有效对局列表（新→旧）：" if list_only else "有效对局详情（新→旧）：")
     for index, record in enumerate(records, 1):
         hero = _hero_label(record.get("hero_id"), hero_names)
         ts = record.get("time")
