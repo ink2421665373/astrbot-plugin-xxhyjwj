@@ -151,6 +151,13 @@ class NarakaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        old_detail_setting = config.get("enable_detail_query")
+        if isinstance(old_detail_setting, bool):
+            config["enable_detail_query"] = "全部开启" if old_detail_setting else "全部关闭"
+            config.save_config()
+        elif old_detail_setting == "仅战绩查询":
+            config["enable_detail_query"] = "仅详细查询"
+            config.save_config()
         data_dir = Path(StarTools.get_data_dir(PLUGIN))
         data_dir.mkdir(parents=True, exist_ok=True)
         self._login_path = data_dir / "login.json"
@@ -213,8 +220,8 @@ class NarakaPlugin(Star):
         value = self.config.get("enable_detail_query", "全部开启")
         if value is False or value == "全部关闭":
             return "全部关闭"
-        if value == "仅战绩查询":
-            return "仅战绩查询"
+        if value in ("仅详细查询", "仅战绩查询"):
+            return "仅详细查询"
         return "全部开启"
 
     def _refresh_enabled(self) -> bool:
@@ -942,7 +949,7 @@ class NarakaPlugin(Star):
                 )
 
             detail_enabled = detail_mode == "全部开启" or (
-                detail_mode == "仅战绩查询" and not detailed
+                detail_mode == "仅详细查询" and detailed
             )
             records = []
             failures = 0
