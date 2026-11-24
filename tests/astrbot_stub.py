@@ -102,7 +102,9 @@ def _build():
     comp = ModuleType("astrbot.api.message_components")
     comp.Plain = type("Plain", (), {})
     comp.At = type("At", (), {})
-    comp.Image = type("Image", (), {})
+    comp.Image = type("Image", (), {"fromBytes": staticmethod(lambda data: ("image", data))})
+    comp.Reply = type("Reply", (), {"__init__": lambda self, **kw: setattr(self, "kw", kw)})
+    comp.File = type("File", (), {})
     comp.Node = type("Node", (), {})
     star_comp = comp
 

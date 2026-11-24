@@ -3,29 +3,40 @@
 设计要点：
 * 所有工具都是**只读**（除可选的解绑），不依赖 ``self.context``，只复用已有的查询核心
   ``_run_read`` / ``_public_search_rows`` / ``_season_report``。
-* 工具**不往群里发消息**（不调用 ``_body`` / ``event.send``），只把结果文本 yield 回去，
-  由 AstrBot 作为 tool result 回传给 LLM，LLM 再组织成人话回答。
+* 工具把结果文本 yield 回去，由 AstrBot 作为 tool result 回传给 LLM，LLM 再组织成人话回答。
+* 当 ``result_display_format`` 为「图片」且 ``llm_tool_send_image`` 开启时，查询类工具还会
+  先按同一份正文渲染长图并 ``event.send`` 到会话，做到「指令」与「自然语言」两种入口都出图；
+  发图失败只记日志，不影响 yield 给模型的文本结果。
 * 为避免对上游（小黑盒）造成压力，工具复用 ``_start_query_cooldown`` / ``_query_lock`` /
   ``_ai_lock`` 等原有保护，并新增 ``llm_tool_max_text_chars`` 限制回传文本长度。
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 
 import aiohttp
+import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 
 from .ai_analysis import AnalysisError
 from .heybox_api import DEFAULT_SERVER, HeyboxError
 from .record_query import resolve_mode
+from .report_image import render_report_images
 
 # 免登录模式（none）下战绩查询退化为角色名片的说明，供多个工具复用
 _NONE_MODE_HINT = (
     "当前插件为「免登录（无绑定）」模式，只能走免登录接口查询角色名片，"
     "无法查询近期战绩、赛季数据，也无法做战绩评价。请在插件配置里把 data_mode 切换为 heybox 或 wechat 并登录。"
+)
+
+# 长图渲染/发送可能抛出的异常：只兜这些，避免把真 bug 一起吞掉
+_TOOL_IMAGE_ERRORS = (
+    OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, AttributeError,
+    HeyboxError, aiohttp.ClientError,
 )
 
 
@@ -51,6 +62,47 @@ class NarakaToolMixin:
         if len(text) <= limit:
             return text
         return text[:limit] + f"\n（结果过长，已截断到 {limit} 字；如需要更完整的数据，请使用对应的文字指令。）"
+
+    def _tool_send_image_enabled(self) -> bool:
+        """自然语言调用是否也把长图发到会话：``llm_tool_send_image``（默认开启）。"""
+        value = self.config.get("llm_tool_send_image", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "false", "0", "no", "off")
+        return bool(value)
+
+    def _tool_image_mode(self) -> bool:
+        """当前显示格式是否要求出图（与 ``_body`` 判据保持一致）。"""
+        return str(self.config.get("result_display_format", "文字") or "文字").strip() in ("图片", "image")
+
+    async def _tool_deliver_image(self, event: AstrMessageEvent, text: str) -> None:
+        """图片模式下把同一份正文渲染成长图并发到会话。
+
+        只在「显示格式=图片」且开关开启时动作；渲染或发送失败只记日志，
+        保证 yield 给模型的文本结果不受影响（不重复发文字，避免和 tool result 打架）。
+        """
+        text = (text or "").strip()
+        if not text or not self._tool_send_image_enabled() or not self._tool_image_mode():
+            return
+        try:
+            images = await asyncio.to_thread(render_report_images, text)
+        except _TOOL_IMAGE_ERRORS as exc:  # 渲染失败：保留纯文本结果
+            logger.warning(f"[naraka][tool] 长图渲染失败，已保留文字结果：{type(exc).__name__}")
+            return
+        if not images:
+            return
+        try:
+            chain = []
+            if self.result_method() == "quote":
+                message_id = self._message_id(event)
+                if message_id:
+                    chain.append(Comp.Reply(id=message_id))
+            chain.extend(Comp.Image.fromBytes(image) for image in images)
+            await event.send(event.chain_result(chain))
+        except _TOOL_IMAGE_ERRORS as exc:  # 发送失败：文本结果已经可用
+            logger.warning(f"[naraka][tool] 长图发送失败，已保留文字结果：{type(exc).__name__}")
+            return
+        if self.config.get("send_original_image_file", False) is True:
+            await self._send_original_images(event, images)
 
     @staticmethod
     def _tool_error_text(exc: Exception) -> str:
@@ -172,7 +224,9 @@ class NarakaToolMixin:
             return
         result = await self._tool_read_with_bind(player, mode, detailed=False)
         if getattr(result, "ok", False):
-            yield self._tool_trim(getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or []))
+            full = getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or [])
+            await self._tool_deliver_image(event, full)
+            yield self._tool_trim(full)
         else:
             yield getattr(result, "reason", "") or "查询失败"
 
@@ -206,7 +260,9 @@ class NarakaToolMixin:
             return
         result = await self._tool_read_with_bind(player, mode, detailed=True)
         if getattr(result, "ok", False):
-            yield self._tool_trim(getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or []))
+            full = getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or [])
+            await self._tool_deliver_image(event, full)
+            yield self._tool_trim(full)
         else:
             yield getattr(result, "reason", "") or "查询失败"
 
@@ -300,7 +356,9 @@ class NarakaToolMixin:
             async for message in self._season_report(event, player, mode_id, season):
                 text = getattr(getattr(message, "chain", None), "get_plain_text", None)
                 chunks.append(text() if callable(text) else str(getattr(message, "text", "")))
-        yield self._tool_trim("\n".join(chunk for chunk in chunks if chunk))
+        full = "\n".join(chunk for chunk in chunks if chunk)
+        await self._tool_deliver_image(event, full)
+        yield self._tool_trim(full)
 
     @filter.llm_tool(name="naraka_ai_analysis")
     async def tool_ai_analysis(self, event: AstrMessageEvent, player: str, mode: str = "") -> AsyncGenerator:
@@ -362,7 +420,9 @@ class NarakaToolMixin:
                 yield f"AI分析未完成：{self._tool_error_text(exc)}"
                 return
             # 和命令通道保持一致：原战绩全文 + AI战绩分析
-            yield self._tool_trim((getattr(ai_result, "report_text", "") or "") + "\n\nAI战绩分析\n" + analysis)
+            full = (getattr(ai_result, "report_text", "") or "") + "\n\nAI战绩分析\n" + analysis
+            await self._tool_deliver_image(event, full)
+            yield self._tool_trim(full)
 
     @filter.llm_tool(name="naraka_unbind")
     async def tool_unbind(self, event: AstrMessageEvent, nickname: str) -> AsyncGenerator:

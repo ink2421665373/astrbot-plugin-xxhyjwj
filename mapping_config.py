@@ -9,6 +9,11 @@ MAPPING_KEYS = ("hero_mappings", "season_mappings")
 # 昵称 → 角色唯一标识（role_id）的对照表，供指令与 LLM 工具共用
 NICKNAME_KEYS = ("nickname_mappings",)
 
+# 小黑盒端游角色主键是**字母数字混合**的 22 位串（4 位随机前缀 + 18 位数字），
+# 例如 2i67000021275100070163、i03c000022562500120163、km1r000078541000270163。
+# 它绝不等于纯数字，所以这里只做「可见字母数字」的形状校验，避免把真实 ID 挡在门外。
+ROLE_ID_PATTERN = re.compile(r"[0-9A-Za-z]{1,64}")
+
 
 def validate_mappings(payload):
     if not isinstance(payload, dict):
@@ -71,7 +76,7 @@ def validate_nickname_mappings(entries) -> list[dict]:
     """校验昵称映射表：[{nickname, role_id, role_name?, server?}]。
 
     * ``nickname`` 必填，最多 80 字
-    * ``role_id`` 必填，只允许数字（小黑盒 game_id），最多 32 位
+    * ``role_id`` 必填，小黑盒 ``game_id``：**字母数字混合**（形如 ``2i67000021275100070163``），最多 64 位
     * 归一化后的昵称不可重复
     """
     if not isinstance(entries, list) or len(entries) > 500:
@@ -88,8 +93,11 @@ def validate_nickname_mappings(entries) -> list[dict]:
         role_id = role_id.strip()
         if not nickname or len(nickname) > 80 or any(ord(char) < 32 for char in nickname):
             raise ValueError(f"昵称第{index}项昵称不能为空，且最多80字")
-        if not role_id or len(role_id) > 32 or not re.fullmatch(r"[0-9]{1,32}", role_id):
-            raise ValueError(f"昵称第{index}项角色ID必须是数字（小黑盒角色ID）")
+        if not role_id or len(role_id) > 64 or not ROLE_ID_PATTERN.fullmatch(role_id):
+            raise ValueError(
+                f"昵称第{index}项角色ID格式不正确：应为小黑盒角色ID（字母和数字，"
+                f"如 2i67000021275100070163），不要手填其它内容"
+            )
         key = _normalize_nickname(nickname)
         if not key:
             raise ValueError(f"昵称第{index}项昵称为空白内容")

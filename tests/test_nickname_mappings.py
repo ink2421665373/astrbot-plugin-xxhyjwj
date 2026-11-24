@@ -45,8 +45,16 @@ class NicknameValidationTests(unittest.TestCase):
         self.assertNotIn("role_name", rows[0])
         self.assertNotIn("server", rows[0])
 
-    def test_role_id_must_be_numeric(self):
-        for bad in ("abc", "12a", "", "1" * 33):
+    def test_role_id_accepts_real_heybox_ids(self):
+        """小黑盒角色ID是字母数字混合，不是纯数字——真实 ID 必须能存。"""
+        for good in ("2i67000021275100070163", "i03c000022562500120163",
+                     "km1r000078541000270163", "b6p0000006545600000163", "123456"):
+            with self.subTest(good=good):
+                rows = validate_nickname_mappings([dict(nickname="a", role_id=good)])
+                self.assertEqual(rows[0]["role_id"], good)
+
+    def test_role_id_format_guard(self):
+        for bad in ("", "1" * 65, "2i67 0000", "角色ID", "2i67-0000", "2i67000021275100070163\nx"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_nickname_mappings([dict(nickname="a", role_id=bad)])
 
@@ -157,7 +165,7 @@ class NicknameViewTests(unittest.TestCase):
 
     def test_save_rejects_invalid_rows(self):
         before = copy.deepcopy(dict(self.config))
-        status, message = self.save(nickname_mappings=[dict(nickname="a", role_id="abc")])
+        status, message = self.save(nickname_mappings=[dict(nickname="a", role_id="2i67 0000")])
         self.assertEqual(status, 400)
         self.assertIn("角色ID", message)
         self.assertEqual(dict(self.config), before)

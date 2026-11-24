@@ -14,10 +14,10 @@ import ast
 import asyncio
 import importlib
 import inspect
-from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +78,9 @@ def make_mixin(**config):
     obj._residual_interval_seconds = MagicMock(return_value=60)
     obj._auto_bind = MagicMock(return_value=True)
     obj._ranked_ids = MagicMock(return_value={4, 5, 13})
+    obj.result_method = MagicMock(return_value="plain")
+    obj._message_id = MagicMock(return_value=None)
+    obj._send_original_images = AsyncMock()
     return obj
 
 
@@ -131,28 +134,43 @@ class LlmToolTests(unittest.TestCase):
             self.assertEqual(params[0], "self")
             self.assertEqual(params[1], "event", f"{attr} 第二个参数必须是 event")
 
-    # ---------- 不发消息 ----------
+    # ---------- 发消息边界 ----------
 
-    def test_tools_never_send_messages(self):
-        """工具只 yield 文本，绝不调用 event.send / _body / _note 等发消息动作。
+    def test_tools_only_send_through_image_channel(self):
+        """除 ``_tool_deliver_image`` 之外，工具绝不调用 event.send / _body / _note 等。
 
         用 AST 检查真实调用点，而不是扫源文本——docstring 里的说明会误伤子串匹配。
+        唯一的发消息入口收敛在 ``_tool_deliver_image``（图片模式下的长图投递）。
         """
         tree = ast.parse(Path(ROOT / "tools.py").read_text(encoding="utf-8"))
         banned_calls = {"send", "plain_result", "chain_result", "image_result"}
         banned_self = {"_body", "_note", "_send_at", "_ack"}
+        allowed = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_tool_deliver_image":
+                allowed.update(id(sub) for sub in ast.walk(node))
         offenders = []
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            if id(node) in allowed or not isinstance(node, ast.Call):
                 continue
             fn = node.func
-            # self._body(...) / self._note(...)
             if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
                 if fn.value.id == "self" and fn.attr in banned_self:
                     offenders.append(f"self.{fn.attr}")
                 if fn.value.id == "event" and fn.attr in banned_calls:
                     offenders.append(f"event.{fn.attr}")
-        self.assertEqual(offenders, [], f"工具不得主动发消息，发现：{offenders}")
+        self.assertEqual(offenders, [], f"工具只允许经 _tool_deliver_image 发消息，发现：{offenders}")
+
+    def test_only_image_channel_helper_sends(self):
+        """确认发消息能力确实只存在于 _tool_deliver_image 内。"""
+        tree = ast.parse(Path(ROOT / "tools.py").read_text(encoding="utf-8"))
+        owners = []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]:
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("send", "chain_result")):
+                    owners.append(fn.name)
+        self.assertEqual(sorted(set(owners)), ["_tool_deliver_image"])
 
     # ---------- 开关 ----------
 
@@ -327,6 +345,109 @@ class ToolReadWithBindTests(unittest.TestCase):
         res = asyncio.run(obj._tool_read_with_bind("张三", "", False))
         self.assertFalse(res.ok)
         self.assertIn("上游炸了", res.reason)
+
+
+class ToolImageDeliveryTests(unittest.TestCase):
+    """图片模式下，自然语言调用也要把同款长图发到会话。"""
+
+    @classmethod
+    def setUpClass(cls):
+        stub_dir = ROOT / "tests"
+        sys.path.insert(0, str(stub_dir))
+        if "astrbot" not in sys.modules:
+            import astrbot_stub  # noqa: F401
+        cls.tools = importlib.import_module("naraka_test_package.tools")
+
+    def image_event(self):
+        event = MagicMock()
+        event.send = AsyncMock()
+        event.chain_result = MagicMock(side_effect=lambda chain: ("chain", chain))
+        return event
+
+    def test_image_mode_sends_chain_with_images(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        event.send.assert_awaited_once()
+        chain = event.chain_result.call_args.args[0]
+        self.assertEqual(chain, [("image", b"png")])
+
+    def test_quote_mode_prepends_reply(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        obj.result_method = MagicMock(return_value="quote")
+        obj._message_id = MagicMock(return_value="99")
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        chain = event.chain_result.call_args.args[0]
+        self.assertEqual(chain[0].__class__.__name__, "Reply")
+        self.assertEqual(chain[1], ("image", b"png"))
+
+    def test_text_mode_does_not_send(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="文字")
+        event = self.image_event()
+        asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        event.send.assert_not_awaited()
+
+    def test_switch_off_does_not_send(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片",
+                         llm_tool_send_image=False)
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        event.send.assert_not_awaited()
+
+    def test_string_false_disables(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片",
+                         llm_tool_send_image="false")
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        event.send.assert_not_awaited()
+
+    def test_render_failure_keeps_text_result(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", side_effect=ValueError("字体缺了")):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+        event.send.assert_not_awaited()
+
+    def test_send_failure_is_swallowed(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        event = self.image_event()
+        event.send = AsyncMock(side_effect=RuntimeError("适配器炸了"))
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            asyncio.run(obj._tool_deliver_image(event, "昵称：张三"))
+
+    def test_summary_tool_delivers_image_and_returns_text(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        obj._tool_read_with_bind = AsyncMock(return_value=SimpleNamespace(
+            ok=True, report_text="昵称：张三\n场均伤害：10000", texts=[], reason=""))
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            out = collect(obj.tool_query_summary(event, "张三"))
+        self.assertIn("场均伤害", "\n".join(out))
+        event.send.assert_awaited_once()
+
+    def test_detail_tool_delivers_image(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        obj._tool_read_with_bind = AsyncMock(return_value=SimpleNamespace(
+            ok=True, report_text="第1局｜伤害 1000", texts=[], reason=""))
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            collect(obj.tool_query_detail(event, "张三"))
+        event.send.assert_awaited_once()
+
+    def test_failed_query_sends_no_image(self):
+        obj = make_mixin(enable_llm_tools=True, result_display_format="图片")
+        obj._tool_read_with_bind = AsyncMock(return_value=SimpleNamespace(
+            ok=False, report_text="", texts=[], reason="没有找到「张三」"))
+        event = self.image_event()
+        with patch.object(self.tools, "render_report_images", return_value=[b"png"]):
+            out = collect(obj.tool_query_summary(event, "张三"))
+        self.assertIn("没有找到", "\n".join(out))
+        event.send.assert_not_awaited()
 
 
 if __name__ == "__main__":
