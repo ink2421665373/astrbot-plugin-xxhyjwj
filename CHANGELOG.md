@@ -1,6 +1,25 @@
 # 更新日志
 
-## 1.7.8
+## 1.7.9
+
+### 新增
+
+- 自然语言调用（LLM 工具）：新增 `tools.py`，把插件能力暴露为 6 个 AstrBot `llm_tool`，
+  由大模型在对话中自行调用：
+  - `naraka_query_summary`：场均概览
+  - `naraka_query_detail`：逐场明细
+  - `naraka_search_player`：搜索玩家（免登录）
+  - `naraka_season_stats`：赛季总览
+  - `naraka_ai_analysis`：AI 战绩评价
+  - `naraka_unbind`：手动解绑（默认关闭，需同时开启两个开关）
+- 新增配置项：`enable_llm_tools`（总开关，默认开）、`llm_tool_allow_unbind`（默认关）、
+  `llm_tool_max_text_chars`（默认 4000，控制回传文本长度）
+
+### 说明
+
+- 工具**不会**主动往群里发消息，只把结果文本回传给大模型，由模型组织回复
+- 工具复用原有全部保护逻辑：冷却、`_query_lock`、`_ai_lock`、群白名单、自动绑定兜底
+- 关闭 `enable_llm_tools` 不影响原有文字指令
 
 - 将插件仓库和更新地址迁移至 ink2421665373/astrbot-plugin-xxhyjwj，保留原插件标识、作者信息及配置兼容性。
 - 新增符合 AstrBot 市场规范的自定义源 plugin-market.json，可在插件源管理添加并绑定更新。

@@ -1,0 +1,403 @@
+"""LLM 工具：把战绩查询能力暴露成 AstrBot 的 llm_tool，让模型用自然语言调用。
+
+设计要点：
+* 所有工具都是**只读**（除可选的解绑），不依赖 ``self.context``，只复用已有的查询核心
+  ``_run_read`` / ``_public_search_rows`` / ``_season_report``。
+* 工具**不往群里发消息**（不调用 ``_body`` / ``event.send``），只把结果文本 yield 回去，
+  由 AstrBot 作为 tool result 回传给 LLM，LLM 再组织成人话回答。
+* 为避免对上游（小黑盒）造成压力，工具复用 ``_start_query_cooldown`` / ``_query_lock`` /
+  ``_ai_lock`` 等原有保护，并新增 ``llm_tool_max_text_chars`` 限制回传文本长度。
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from types import SimpleNamespace
+
+import aiohttp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+
+from .ai_analysis import AnalysisError
+from .heybox_api import DEFAULT_SERVER, HeyboxError
+from .record_query import resolve_mode
+
+# 免登录模式（none）下战绩查询退化为角色名片的说明，供多个工具复用
+_NONE_MODE_HINT = (
+    "当前插件为「免登录（无绑定）」模式，只能走免登录接口查询角色名片，"
+    "无法查询近期战绩、赛季数据，也无法做战绩评价。请在插件配置里把 data_mode 切换为 heybox 或 wechat 并登录。"
+)
+
+
+class NarakaToolMixin:
+    """被 :class:`~.main.NarakaPlugin` 继承，提供 LLM 可调用的工具方法。"""
+
+    # ==================== 内部辅助 ====================
+
+    def _tool_enabled(self) -> bool:
+        """总开关：``enable_llm_tools``（默认开启）。"""
+        return bool(self.config.get("enable_llm_tools", True))
+
+    def _tool_max_chars(self) -> int:
+        value = self.config.get("llm_tool_max_text_chars", 4000)
+        try:
+            return max(500, int(value))
+        except (TypeError, ValueError):
+            return 4000
+
+    def _tool_trim(self, text: str) -> str:
+        limit = self._tool_max_chars()
+        text = (text or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n（结果过长，已截断到 {limit} 字；如需要更完整的数据，请使用对应的文字指令。）"
+
+    @staticmethod
+    def _tool_error_text(exc: Exception) -> str:
+        """复用主类的错误文案；主类没有该实现时退化成原始信息。"""
+        impl = getattr(NarakaToolMixin, "_error_text", None)
+        if impl is None:
+            return str(exc) or type(exc).__name__
+        try:
+            return impl(exc)
+        except (AttributeError, TypeError):
+            return str(exc) or type(exc).__name__
+
+    async def _tool_residual_recover(self) -> None:
+        """和命令通道一样，在查询前补一次残留解绑。失败只记日志。"""
+        try:
+            async with self._session() as session:
+                await self._binding.recover(session, self._residual_interval_seconds())
+        except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+            logger.warning(f"[naraka][tool] 残留恢复失败: {type(exc).__name__}")
+
+    async def _tool_read_with_bind(self, player: str, mode: str, detailed: bool,
+                                   force_refresh: bool = False) -> object:
+        """只读查询 + 自动绑定兜底，返回 ``_ReadResult``。
+
+        逻辑与命令版 ``_query_records`` 的阶段一/阶段二等价，但**不发送任何消息**，
+        只在最后返回一个结果对象供调用方取 ``report_text`` / ``reason``。
+        """
+        report = None
+        if isinstance(mode, str) and mode.strip():
+            try:
+                resolve_mode(mode)
+            except ValueError as exc:
+                return self._fail_result(str(exc))
+
+        if self.data_mode == "none":
+            return self._fail_result(_NONE_MODE_HINT)
+        if not self.logged_in:
+            return self._fail_result("尚未登录小黑盒，需要管理员私聊发送 /永劫登录。")
+
+        await self._tool_residual_recover()
+
+        # ---- 阶段一：只读 ----
+        async with self._query_lock:
+            try:
+                report = await self._run_read(player, mode, detailed,
+                                              force_refresh=force_refresh, for_ai=False)
+            except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+                return self._fail_result(self._tool_error_text(exc))
+        if report.ok or not report.needs_bind:
+            return report
+
+        # ---- 阶段二：绑定 → 再读 → 解绑 ----
+        nickname = report.nickname or player
+        if not self._auto_bind():
+            return self._fail_result(f"没有找到「{nickname}」，请用 永劫搜索 核对昵称。")
+        if self._binding.negative_hit(nickname.strip().lower()):
+            return self._fail_result(f"「{nickname}」暂时没有可查数据，请稍后再试，或用 永劫搜索 核对昵称。")
+
+        again = None
+        async with self._session() as session, self._binding.bound(session, nickname, DEFAULT_SERVER) as outcome:
+            if not outcome.ok:
+                return self._fail_result(
+                    self._bind_failure_text(nickname, outcome, forced=False))
+            try:
+                async with self._query_lock:
+                    again = await self._run_read(player, mode, detailed,
+                                                 force_refresh=force_refresh, for_ai=False)
+            except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+                again = self._fail_result(self._tool_error_text(exc))
+            if not again.ok and getattr(again, "needs_bind", False):
+                    self._binding.mark_negative(nickname.strip().lower())
+        return again or report
+
+    def _fail_result(self, reason: str) -> object:
+        """构造一个失败的 ``_ReadResult``。
+
+        优先复用主类里的 ``_ReadResult``；万一拿不到（例如在测试替身里、
+        或 main 尚未完成导入），退化成一个等价的轻量对象，避免把整个
+        main 及其第三方依赖（qrcode 等）拖进来。
+        """
+        try:
+            from .main import _ReadResult  # 局部导入：tools 被 main 引用
+
+            return _ReadResult(ok=False, reason=reason)
+        except ImportError:
+            return SimpleNamespace(ok=False, reason=reason, texts=[], needs_bind=False,
+                                   nickname="", report_text="", analysis_data={})
+
+    # ==================== 具体工具 ====================
+
+    @filter.llm_tool(name="naraka_query_summary")
+    async def tool_query_summary(self, event: AstrMessageEvent, player: str, mode: str = "") -> AsyncGenerator:
+        """查询《永劫无间》端游玩家近期战绩概览（场均伤害、击败、振刀、恢复、存活等）。
+
+        用于回答"某人最近打得怎么样""场均伤害多少"这类问题。
+        注意：必须传玩家昵称（nickname），本工具不支持按角色ID查询。
+
+        Args:
+            player(string): 玩家昵称，例如"张三"；不支持角色ID
+            mode(string): 可选，模式筛选，如"天人""天选""单排""双排""三排"；留空自动选择最新一场排位对局的模式
+        """
+        if not self._tool_enabled():
+            yield "战绩工具已关闭（enable_llm_tools=false）。"
+            return
+        if not player or not str(player).strip():
+            yield "需要提供玩家昵称。"
+            return
+        player = str(player).strip()
+        mode = str(mode or "").strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            yield f"查询过于频繁，请 {cooldown} 秒后再试。"
+            return
+        if self.data_mode == "none":
+            yield _NONE_MODE_HINT
+            return
+        result = await self._tool_read_with_bind(player, mode, detailed=False)
+        if getattr(result, "ok", False):
+            yield self._tool_trim(getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or []))
+        else:
+            yield getattr(result, "reason", "") or "查询失败"
+
+    @filter.llm_tool(name="naraka_query_detail")
+    async def tool_query_detail(self, event: AstrMessageEvent, player: str, mode: str = "") -> AsyncGenerator:
+        """查询《永劫无间》端游玩家近期逐场战绩（每局的英雄、伤害、击败、排名等明细）。
+
+        用于回答"某某一局具体数据""最近几场分别怎么样"这类问题。
+
+        Args:
+            player(string): 玩家昵称；不支持角色ID
+            mode(string): 可选，模式筛选（天人/天选/单排/双排/三排）；留空自动选择最新排位模式
+        """
+        if not self._tool_enabled():
+            yield "战绩工具已关闭（enable_llm_tools=false）。"
+            return
+        if not player or not str(player).strip():
+            yield "需要提供玩家昵称。"
+            return
+        player = str(player).strip()
+        mode = str(mode or "").strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            yield f"查询过于频繁，请 {cooldown} 秒后再试。"
+            return
+        if self.data_mode == "none":
+            yield _NONE_MODE_HINT
+            return
+        result = await self._tool_read_with_bind(player, mode, detailed=True)
+        if getattr(result, "ok", False):
+            yield self._tool_trim(getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or []))
+        else:
+            yield getattr(result, "reason", "") or "查询失败"
+
+    @filter.llm_tool(name="naraka_search_player")
+    async def tool_search_player(self, event: AstrMessageEvent, nickname: str) -> AsyncGenerator:
+        """搜索《永劫无间》玩家（免登录，不需要登录也能用）。
+
+        用于确认昵称对应的玩家是否存在、以及精确昵称是什么。搜不到时用它核对昵称。
+
+        Args:
+            nickname(string): 要搜索的玩家昵称
+        """
+        if not self._tool_enabled():
+            yield "战绩工具已关闭（enable_llm_tools=false）。"
+            return
+        if not nickname or not str(nickname).strip():
+            yield "需要提供玩家昵称。"
+            return
+        nickname = str(nickname).strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            yield f"查询过于频繁，请 {cooldown} 秒后再试。"
+            return
+        try:
+            async with self._session() as session:
+                rows = await self._public_search_rows(session, nickname, limit=10)
+        except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+            yield f"查询失败：{self._tool_error_text(exc)}"
+            return
+        if not rows:
+            yield f"没有找到「{nickname}」。"
+            return
+        lines = [f"搜索「{nickname}」："]
+        for row in rows[:10]:
+            lines.append(self._public_row_line(row))
+        lines.append(f"查近期对局：战绩查询 {nickname}")
+        yield self._tool_trim("\n".join(lines))
+
+    @filter.llm_tool(name="naraka_season_stats")
+    async def tool_season_stats(self, event: AstrMessageEvent, player: str,
+                                mode: str = "", season: str = "当前") -> AsyncGenerator:
+        """查询《永劫无间》玩家的赛季总览数据（段位、评分、赛季场均等）。
+
+        用于回答"某某这个赛季什么段位""赛季数据怎么样"这类问题。
+
+        Args:
+            player(string): 玩家昵称；不支持角色ID
+            mode(string): 可选，天人/天选 + 单排/双排/三排；赛季总览只支持这些排位模式
+            season(string): 可选，"当前"=配置的当前赛季，"全部"=全部赛季，"列表"=列出可用赛季，或直接填赛季名
+        """
+        if not self._tool_enabled():
+            yield "战绩工具已关闭（enable_llm_tools=false）。"
+            return
+        if not player or not str(player).strip():
+            yield "需要提供玩家昵称。"
+            return
+        player = str(player).strip()
+        mode = str(mode or "").strip()
+        season = str(season or "当前").strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        if self.data_mode == "none":
+            yield _NONE_MODE_HINT
+            return
+        if not self.logged_in:
+            yield "尚未登录小黑盒，需要管理员私聊发送 /永劫登录。"
+            return
+        mode_id = None
+        if mode:
+            try:
+                mode_id = resolve_mode(mode)
+            except ValueError as exc:
+                yield str(exc)
+                return
+            if mode_id not in self._ranked_ids():
+                yield "赛季总览只支持天人和天选的单排、双排、三排。"
+                return
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            yield f"查询过于频繁，请 {cooldown} 秒后再试。"
+            return
+        if self._query_lock.locked():
+            yield "已有一份战绩正在查询，请稍后再试。"
+            return
+        chunks: list[str] = []
+        async with self._query_lock:
+            async for message in self._season_report(event, player, mode_id, season):
+                text = getattr(getattr(message, "chain", None), "get_plain_text", None)
+                chunks.append(text() if callable(text) else str(getattr(message, "text", "")))
+        yield self._tool_trim("\n".join(chunk for chunk in chunks if chunk))
+
+    @filter.llm_tool(name="naraka_ai_analysis")
+    async def tool_ai_analysis(self, event: AstrMessageEvent, player: str, mode: str = "") -> AsyncGenerator:
+        """让 AI 对《永劫无间》玩家近期战绩做一段评价（优点、可改进点、可执行建议）。
+
+        用于回答"评价一下某某的战绩""某某打得有什么问题"这类问题。会用已配置的模型+人格生成评价。
+
+        Args:
+            player(string): 玩家昵称；不支持角色ID
+            mode(string): 可选，天人/天选 + 单排/双排/三排；留空自动选择最新排位模式
+        """
+        if not self._tool_enabled():
+            yield "战绩工具已关闭（enable_llm_tools=false）。"
+            return
+        if self.config.get("enable_ai_analysis", True) is not True:
+            yield "AI战绩分析已关闭，请管理员在插件配置中启用。"
+            return
+        if not player or not str(player).strip():
+            yield "需要提供玩家昵称。"
+            return
+        player = str(player).strip()
+        mode = str(mode or "").strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        if self.data_mode == "none":
+            yield _NONE_MODE_HINT
+            return
+        if not self.logged_in:
+            yield "尚未登录小黑盒，需要管理员私聊发送 /永劫登录。"
+            return
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            yield f"查询过于频繁，请 {cooldown} 秒后再试。"
+            return
+        if self._ai_lock.locked():
+            yield "已有AI分析正在进行，请稍后再试。"
+            return
+        async with self._ai_lock:
+            result = await self._tool_read_with_bind(player, mode, detailed=False, force_refresh=False)
+            if not getattr(result, "ok", False):
+                yield getattr(result, "reason", "") or "查询失败"
+                return
+            # 重新取一次带 for_ai 的分析数据
+            async with self._query_lock:
+                try:
+                    ai_result = await self._run_read(player, mode, False, force_refresh=False, for_ai=True)
+                except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+                    yield self._tool_error_text(exc)
+                    return
+            if not getattr(ai_result, "ok", False):
+                yield getattr(ai_result, "reason", "") or "查询失败"
+                return
+            data = getattr(ai_result, "analysis_data", {}) or {}
+            try:
+                analysis = await self._evaluate_records(event, data)
+            except (AnalysisError, TimeoutError, HeyboxError,
+                    aiohttp.ClientError, ValueError) as exc:
+                yield f"AI分析未完成：{self._tool_error_text(exc)}"
+                return
+            # 和命令通道保持一致：原战绩全文 + AI战绩分析
+            yield self._tool_trim((getattr(ai_result, "report_text", "") or "") + "\n\nAI战绩分析\n" + analysis)
+
+    @filter.llm_tool(name="naraka_unbind")
+    async def tool_unbind(self, event: AstrMessageEvent, nickname: str) -> AsyncGenerator:
+        """手动解绑《永劫无间》玩家绑定（清除该昵称在小黑盒账号上的绑定）。
+
+        会写操作，有副作用：仅在确实需要清理绑定残留时使用。
+
+        Args:
+            nickname(string): 要解绑的玩家昵称
+        """
+        if not self._tool_enabled() or not self.config.get("llm_tool_allow_unbind", False):
+            yield "解绑工具未开启（需要 enable_llm_tools=true 且 llm_tool_allow_unbind=true）。"
+            return
+        if not nickname or not str(nickname).strip():
+            yield "需要提供玩家昵称。"
+            return
+        nickname = str(nickname).strip()
+        if not self._allowed_group(event):
+            yield "当前群不在白名单内，无法使用战绩工具。"
+            return
+        if self.data_mode == "none":
+            yield "当前为无绑定模式，无需解绑。"
+            return
+        if not self.logged_in:
+            yield "尚未登录小黑盒，无法解绑。"
+            return
+        async with self._session() as session:
+            ok, reason = await self._binding.manual_unbind(session, nickname, DEFAULT_SERVER)
+        logger.info(f"[naraka][tool] 解绑 nickname={nickname!r} ok={ok}")
+        yield f"已解绑 {nickname}" if ok else f"{nickname} 解绑失败：{reason}"
+
+    def _ranked_ids(self):
+        from .record_query import RANKED_IDS
+
+        return RANKED_IDS
+
+
+__all__ = ["NarakaToolMixin"]

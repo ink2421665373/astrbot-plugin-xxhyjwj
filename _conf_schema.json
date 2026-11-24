@@ -481,5 +481,23 @@
     "description": "AI战绩证据输入字符预算",
     "default": 12000,
     "hint": "范围3000至30000字符，不含所选人格提示词。超预算优先减少AI明细和部分概览指标，保留近期汇总；不影响原战绩展示。可按模型上下文大小调整。"
+  },
+  "enable_llm_tools": {
+    "type": "bool",
+    "description": "启用 LLM 工具调用（自然语言查战绩）",
+    "default": true,
+    "hint": "开启后本插件会把「战绩查询/详细查询/玩家搜索/赛季总览/AI评价」注册为 llm_tool。需在 AstrBot 会话或人格里同时开启「工具调用（Function Calling）」，模型才能用自然语言直接调用这些能力。关闭则不注册任何工具，原有指令不受影响。"
+  },
+  "llm_tool_allow_unbind": {
+    "type": "bool",
+    "description": "允许 LLM 调用解绑工具",
+    "default": false,
+    "hint": "解绑是写操作且有副作用，默认不暴露给模型。仅当你确实需要让 AI 清理绑定残留时才开启。"
+  },
+  "llm_tool_max_text_chars": {
+    "type": "int",
+    "description": "工具回传给 LLM 的最大字符数",
+    "default": 4000,
+    "hint": "超出则截断（下限500）。防止逐场战绩等长文本把模型上下文打爆。设为较大值可获得更完整结果，但会增加 token 消耗。"
   }
 }

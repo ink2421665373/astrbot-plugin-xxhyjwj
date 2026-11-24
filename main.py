@@ -62,6 +62,7 @@ from .record_query import (
     split_detail_report,
 )
 from .xiaoheihe_login import LoginState, create_login_client, generate_device_id
+from .tools import NarakaToolMixin
 
 PLUGIN = "astrbot_plugin_naraka"
 LOGIN_MODES = ("wechat", "heybox")
@@ -185,8 +186,8 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.7.8")
-class NarakaPlugin(AIAnalysisMixin, MappingViewMixin, Star):
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.7.9")
+class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
