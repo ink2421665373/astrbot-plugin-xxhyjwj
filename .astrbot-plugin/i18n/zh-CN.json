@@ -1,0 +1,22 @@
+{
+  "views": {
+    "mappings": {
+      "title": "英雄与赛季",
+      "description": "可视化维护英雄、赛季编码和名称，并指定当前赛季。"
+    },
+    "diagnostics": {
+      "title": "数据诊断",
+      "description": "查看接口返回的赛季编码、指标、缺失情况和请求时间。"
+    }
+  },
+  "pages": {
+    "mappings": {
+      "title": "英雄与赛季",
+      "description": "可视化维护英雄、赛季编码和名称，并指定当前赛季。"
+    },
+    "diagnostics": {
+      "title": "数据诊断",
+      "description": "查看接口返回的赛季编码、指标、缺失情况和请求时间。"
+    }
+  }
+}

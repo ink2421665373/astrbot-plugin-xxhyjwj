@@ -230,6 +230,7 @@ class BindingManager:
                 return True, ""
             except HeyboxRateLimited as exc:
                 last_error = str(exc)
+                break
             except HeyboxError as exc:
                 last_error = str(exc)
             if attempt + 1 < self.unbind_attempts:

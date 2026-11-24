@@ -14,8 +14,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import secrets
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import aiohttp
@@ -64,6 +67,11 @@ class HeyboxLoginRequired(HeyboxError):
 
 class HeyboxRateLimited(HeyboxError):
     """被上游限流。"""
+
+    def __init__(self, message="请求过于频繁", *, path="", retry_after=None):
+        super().__init__(message)
+        self.path = path
+        self.retry_after = _retry_after_seconds(retry_after)
 
 
 class HeyboxNetworkError(HeyboxError):
@@ -153,7 +161,23 @@ def sign_params(
 
 def _rate_limited(message: str) -> bool:
     lowered = message.lower()
-    return "频繁" in message or "429" in lowered or "rate limit" in lowered
+    return any(word in lowered for word in ("频繁", "限流", "请求过多", "频率过高", "降低请求频率", "429", "rate limit", "too many requests", "too_many_requests"))
+
+
+def _retry_after_seconds(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            stamp = parsedate_to_datetime(str(value))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            seconds = max(0, stamp.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def check_envelope(payload: Any, path: str = "") -> dict[str, Any]:
@@ -166,8 +190,8 @@ def check_envelope(payload: Any, path: str = "") -> dict[str, Any]:
     if status in ("login", "relogin"):
         raise HeyboxLoginRequired(message or "小黑盒登录已失效")
     if status not in ("", "ok", "success"):
-        if _rate_limited(message):
-            raise HeyboxRateLimited(message or "请求过于频繁")
+        if _rate_limited(message) or _rate_limited(status):
+            raise HeyboxRateLimited(message or "请求过于频繁", path=path)
         raise HeyboxError(message or f"接口返回错误（{status}）")
 
     body = payload.get("result")
@@ -227,9 +251,13 @@ class HeyboxClient:
             ) as response:
                 text = await response.text()
                 status_code = response.status
+                retry_after = response.headers.get("Retry-After")
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise HeyboxNetworkError(f"{type(exc).__name__}") from exc
 
+        if status_code == 429:
+            # 429 may return an HTML error page instead of a JSON envelope.
+            raise HeyboxRateLimited("请求过于频繁（HTTP 429）", path=path, retry_after=retry_after)
         try:
             payload = json.loads(text)
         except ValueError as exc:
@@ -264,16 +292,7 @@ class HeyboxClient:
         """校验信封，但允许缺失 status（免登录搜索在无结果时就是这样）。"""
         payload = await self.raw(session, method, path, params, signed=signed,
                                  with_cookies=with_cookies)
-        status = str(payload.get("status") or "").strip().lower()
-        if status in ("login", "relogin"):
-            raise HeyboxLoginRequired(str(payload.get("msg") or ""))
-        if status not in ("", "ok", "success"):
-            message = str(payload.get("msg") or "")
-            if _rate_limited(message):
-                raise HeyboxRateLimited(message)
-            raise HeyboxError(message or f"接口返回错误（{status}）")
-        body = payload.get("result")
-        return body if isinstance(body, dict) else {}
+        return check_envelope(payload, path)
 
     # ---------- 查询类接口 ----------
 

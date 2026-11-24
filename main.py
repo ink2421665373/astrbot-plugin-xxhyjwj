@@ -1,4 +1,4 @@
-﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
@@ -29,6 +30,12 @@ from astrbot.api.star import Context, Star, StarTools, register
 import astrbot.api.message_components as Comp
 
 from .binding import BindingManager
+from .ai_analysis import AIAnalysisMixin, build_analysis_data
+from .delivery import QueryProgress, save_originals, split_message
+from .auth_state import read_saved_auth
+from .mapping_config import merge_season_options
+from .mapping_views import MappingViewMixin
+from .report_image import render_report_images
 from .heybox_api import (
     DEFAULT_SERVER,
     HeyboxClient,
@@ -43,8 +50,11 @@ from .record_query import (
     apply_hero_mappings,
     format_details,
     format_identity,
+    format_query_metadata,
     format_summary,
     make_record,
+    match_mode_counts,
+    normalize_rank_data,
     recent_rows,
     resolve_mode,
     select_matches,
@@ -60,7 +70,7 @@ MODE_LABEL = {"wechat": "微信", "heybox": "小黑盒 App"}
 
 def _is_rate_limited(value: object) -> bool:
     message = str(value).lower()
-    return "频繁" in message or "429" in message or "rate limit" in message
+    return any(word in message for word in ("频繁", "限流", "请求过多", "频率过高", "降低请求频率", "429", "rate limit", "too many requests", "too_many_requests"))
 
 
 def _must_stop_after_error(exc: Exception) -> bool:
@@ -103,34 +113,61 @@ def looks_like_role_id(value: str) -> bool:
     return any(pattern.fullmatch(text) for pattern in _ROLE_ID_SHAPES)
 
 
-def _choose_season(options: object, requested: str) -> tuple[str, str]:
-    """Pick a season exposed by the API, without guessing its internal key."""
-    entries = [x for x in options if isinstance(x, dict)] if isinstance(options, list) else []
+def _choose_season(options: object, requested: str, mappings: object = None) -> tuple[str, str]:
+    """Prefer a saved query scope, otherwise require an explicit active-season flag."""
+    entries = merge_season_options(options, mappings)
     choices = [
         (str(x.get("key") or ""), str(x.get("value") or ""), x)
         for x in entries
         if x.get("key")
     ]
-    if requested == "全部":
+    mapped_current = [item for item in choices if item[2].get("_manual_current")]
+    if len(mapped_current) > 1:
+        raise ValueError("最多只能指定一个查询赛季")
+    if mapped_current and mapped_current[0][0] == "pre-01" and requested in (
+        "当前", "全部", "pre-01", mapped_current[0][1]
+    ):
+        return "pre-01", "全部赛季"
+    if requested in ("全部", "全部赛季", "pre-01"):
         return "pre-01", "全部赛季"
     if requested == "当前":
-        current = next(
-            (item for item in choices if item[0] != "pre-01" and any(item[2].get(k) for k in ("is_current", "current", "selected"))),
-            None,
-        )
-        if current is None:
-            # The live selector observed in September 2026 is oldest first.
-            recent_first = [item for item in choices if item[0] != "pre-01"]
-            current = recent_first[-1] if recent_first else None
-        return (current[0], current[1]) if current else ("pre-01", "全部赛季")
-    match = next(
-        (item for item in choices if requested == item[0] or requested in item[1]),
-        None,
-    )
-    if match is None:
-        names = "、".join(x[1] for x in choices[:8]) or "暂无"
-        raise ValueError(f"没有找到赛季「{requested}」。可用赛季：{names}")
+        if not choices:
+            raise ValueError("接口未提供可用赛季，无法确认当前赛季数据")
+        # `selected` denotes a UI selection, not the active game season.
+        # Parse string flags explicitly: bool("false") is True in Python.
+        if mapped_current:
+            # A saved operator choice selects a query scope. It need not be
+            # the game's active season and must not be vetoed by auto detection.
+            manual = mapped_current[0]
+            return manual[0], manual[1] + "（WebUI配置）"
+        active = [item for item in choices if item[0] != "pre-01" and any(
+            str(item[2].get(key, "")).strip().lower() in ("true", "1")
+            for key in ("is_current", "current"))]
+        if len(active) != 1:
+            raise ValueError("接口未唯一标明当前赛季，无法确认本赛季。请用 永劫赛季 昵称 模式 列表 查看完整选项；也可指定赛季名查询历史数据。")
+        current = active[0]
+        # Official PC settlement: 2026-10-09 08:00 Asia/Shanghai.
+        # https://www.yjwujian.cn/news/update/20261010/33456_1316200.html
+        if "千机" in current[1] and time.time() >= 1791504000:
+            raise ValueError("接口仍将已于2026-10-09结束的千机赛季标为当前，无法获取已核实的本赛季数据。请用 永劫赛季 昵称 模式 列表 检查接口支持的赛季。")
+        return current[0], current[1]
+    exact = [item for item in choices if requested in (item[0], item[1])]
+    matches = exact or [item for item in choices if requested and requested in item[1]]
+    if not matches:
+        names = "\n".join(f"{item[1]}｜{item[0]}" for item in choices) or "暂无"
+        raise ValueError(f"没有找到赛季「{requested}」。接口返回的完整赛季列表（共{len(choices)}项）：\n{names}\n这里只匹配接口已提供的选项，不推测新赛季ID。")
+    if len(matches) > 1:
+        names = "、".join(item[1] for item in matches)
+        raise ValueError(f"赛季「{requested}」匹配到多项：{names}。请使用完整赛季名或列表中的ID。")
+    match = matches[0]
     return match[0], match[1]
+
+
+def _configured_season(mappings: object) -> tuple[str, str] | None:
+    """Resolve a saved scope before any query request; reject invalid settings."""
+    if any(item.get("_manual_current") for item in merge_season_options([], mappings)):
+        return _choose_season([], "当前", mappings)
+    return None
 
 
 @dataclass
@@ -144,13 +181,19 @@ class _ReadResult:
     role_id: str = ""
     server: str = DEFAULT_SERVER
     reason: str = ""                  # 失败原因，可直接展示
+    report_text: str = ""
+    analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.5.1")
-class NarakaPlugin(Star):
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.7.8")
+class NarakaPlugin(AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._ai_context = context
+        self._ai_lock = asyncio.Lock()
+        if not self._setup_mapping_view(context):
+            logger.warning("[naraka] 当前 AstrBot 不支持插件可视化视图，请升级；英雄和赛季仍可在插件配置中编辑")
         old_detail_setting = config.get("enable_detail_query")
         if isinstance(old_detail_setting, bool):
             config["enable_detail_query"] = "全部开启" if old_detail_setting else "全部关闭"
@@ -160,6 +203,7 @@ class NarakaPlugin(Star):
             config.save_config()
         data_dir = Path(StarTools.get_data_dir(PLUGIN))
         data_dir.mkdir(parents=True, exist_ok=True)
+        self._original_image_dir = data_dir / "original_images"
         self._login_path = data_dir / "login.json"
 
         self._login_lock = asyncio.Lock()
@@ -168,6 +212,7 @@ class NarakaPlugin(Star):
         self._last_query_started_at: float | None = None
         self._last_request_at: float | None = None
         self._last_detail_request_at: float | None = None
+        self._rate_limited_until = 0.0
         self._detail_cache: dict[tuple[str, str], dict] = {}
 
         self._auth = self._load_auth()
@@ -270,11 +315,15 @@ class NarakaPlugin(Star):
     # ==================== 基础设施 ====================
 
     def _load_auth(self) -> dict:
-        try:
-            value = json.loads(self._login_path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (FileNotFoundError, ValueError, OSError):
-            return {}
+        return read_saved_auth(self._login_path)[0]
+
+    def _reload_web_auth(self) -> str:
+        """A reloaded Web API instance may predate the latest chat login."""
+        auth, file_state = read_saved_auth(self._login_path)
+        if file_state in ("saved", "empty", "missing") and auth != self._auth:
+            self._auth = auth
+            self._refresh_api()
+        return file_state
 
     def _save_auth(self, value: dict) -> None:
         tmp = self._login_path.with_suffix(".tmp")
@@ -297,7 +346,7 @@ class NarakaPlugin(Star):
 
     def _interval_b(self) -> float:
         """B：机器人每一次上游请求之间的最小间隔（0 = 关闭）。"""
-        return self._number_setting("request_interval_seconds", 0.0, 0.0, 120.0)
+        return self._number_setting("request_interval_seconds", 1.5, 0.0, 120.0)
 
     def _interval_c(self) -> float:
         """C：仅单局查询之间互相的额外最小间隔（0 = 关闭）。"""
@@ -315,6 +364,9 @@ class NarakaPlugin(Star):
         """
         async with self._request_lock:
             now = time.monotonic()
+            remaining = getattr(self, "_rate_limited_until", 0.0) - now
+            if remaining > 0:
+                raise HeyboxRateLimited("上游限流，本地暂停请求", retry_after=remaining)
             wait = 0.0
             interval_b = self._interval_b()
             if interval_b > 0 and self._last_request_at is not None:
@@ -327,6 +379,14 @@ class NarakaPlugin(Star):
                 await asyncio.sleep(wait)
             try:
                 yield
+            except HeyboxRateLimited as exc:
+                delay = max(self._number_setting("rate_limit_cooldown_seconds", 60.0, 10.0, 3600.0),
+                            exc.retry_after or 0)
+                self._rate_limited_until = max(getattr(self, "_rate_limited_until", 0.0), time.monotonic() + delay)
+                exc.retry_after = delay
+                logger.warning("[naraka] upstream rate limit: path=%s; local_pause=%ss",
+                               exc.path or "unknown", max(1, int(delay + 0.999)))
+                raise
             finally:
                 stamp = time.monotonic()
                 self._last_request_at = stamp
@@ -340,6 +400,9 @@ class NarakaPlugin(Star):
     def _start_query_cooldown(self) -> int:
         """Reserve one user-initiated query and return remaining cooldown seconds."""
         now = time.monotonic()
+        remaining = getattr(self, "_rate_limited_until", 0.0) - now
+        if remaining > 0:
+            return max(1, int(remaining + 0.999))
         interval = self._number_setting("query_interval_seconds", 4.0, 0.0, 120.0)
         if self._last_query_started_at is not None:
             remaining = interval - (now - self._last_query_started_at)
@@ -378,7 +441,7 @@ class NarakaPlugin(Star):
                 return event.chain_result([Comp.Reply(id=message_id), Comp.Plain(message)])
         return event.plain_result(message)
 
-    async def _send_at(self, event: AstrMessageEvent, message: str) -> bool:
+    async def _send_at(self, event: AstrMessageEvent, message: str, images: list[bytes] | None = None) -> bool:
         """at 模式：直接 event.bot.send(raw, [at段, text段])，任何失败返回 False。"""
         try:
             if event.get_platform_name() != "aiocqhttp":
@@ -388,24 +451,79 @@ class NarakaPlugin(Star):
             sender_id = str(event.get_sender_id() or "").strip()
             if bot is None or raw is None or not sender_id:
                 return False
-            await bot.send(raw, [
-                {"type": "at", "data": {"qq": sender_id}},
-                {"type": "text", "data": {"text": " " + message}},
-            ])
+            segments = [{"type": "at", "data": {"qq": sender_id}}]
+            if images:
+                segments.append({"type": "text", "data": {"text": " "}})
+                segments.extend({"type": "image", "data": {
+                    "file": "base64://" + base64.b64encode(image).decode("ascii")
+                }} for image in images)
+            else:
+                segments.append({"type": "text", "data": {"text": " " + message}})
+            await bot.send(raw, segments)
             return True
         except Exception as exc:
-            logger.warning(f"[naraka] at 模式底层发送失败，退回纯文本：{type(exc).__name__}")
+            logger.warning(f"[naraka] at 模式底层发送失败，退回普通回复：{type(exc).__name__}")
             return False
 
     def result_method(self) -> str:
         """当前生效的战绩正文回复方式。"""
         return str(self.config.get("result_reply_method", "quote") or "quote").strip().lower()
 
-    async def _body(self, event: AstrMessageEvent, message: str, first: bool = False):
+    async def _send_text_fallback(self, event, message, method):
+        chunks = split_message("图片生成失败，已改用文字显示。\n" + message)
+        for index, chunk in enumerate(chunks):
+            current_method = method if index == 0 or method not in ("at", "mention") else "plain"
+            result = await self._reply(event, chunk, method=current_method)
+            if index == len(chunks) - 1:
+                return result
+            if result is not None:
+                await event.send(result)
+
+    async def _send_original_images(self, event, images):
+        try:
+            paths = await asyncio.to_thread(save_originals, self._original_image_dir, images)
+            for path in paths:
+                await event.send(event.chain_result([Comp.File(name=path.name, file=str(path))]))
+        except Exception as exc:
+            logger.warning(f"[naraka] 原图文件发送失败：{type(exc).__name__}")
+            return event.plain_result("原图文件发送失败，图片结果已保留。请检查适配器文件支持，以及跨容器部署时的文件访问配置。")
+        return None
+
+    async def _body(self, event: AstrMessageEvent, message: str, first: bool = False, progress=None):
         """战绩正文；first=False 时不 @（at 只加在第一条分条上）。"""
         method = self.result_method()
         if not first and method in ("at", "mention"):
             method = "plain"
+        output_format = str(self.config.get("result_display_format", "文字") or "文字").strip()
+        if output_format in ("图片", "image"):
+            if progress:
+                await progress("数据已获取，正在生成完整长图…", force=True)
+            try:
+                images = await asyncio.to_thread(render_report_images, message)
+            except Exception as exc:
+                logger.warning(f"[naraka] 图片生成失败，回退文字：{type(exc).__name__}")
+                if progress:
+                    await progress.close()
+                return await self._send_text_fallback(event, message, method)
+            if progress:
+                await progress.close()
+            original_file = self.config.get("send_original_image_file", False) is True
+            if method in ("at", "mention"):
+                if await self._send_at(event, "", images=images):
+                    return await self._send_original_images(event, images) if original_file else None
+            chain = []
+            if method == "quote":
+                message_id = self._message_id(event)
+                if message_id:
+                    chain.append(Comp.Reply(id=message_id))
+            chain.extend(Comp.Image.fromBytes(image) for image in images)
+            result = event.chain_result(chain)
+            if original_file:
+                await event.send(result)
+                return await self._send_original_images(event, images)
+            return result
+        if progress:
+            await progress.close()
         return await self._reply(event, message, method=method)
 
     @staticmethod
@@ -454,6 +572,8 @@ class NarakaPlugin(Star):
         if isinstance(exc, HeyboxLoginRequired):
             return "小黑盒登录已失效，请管理员重新发送 /永劫登录"
         if isinstance(exc, HeyboxRateLimited):
+            if exc.retry_after is not None:
+                return f"小黑盒已限流，插件已暂停上游请求，请约{max(1, int(exc.retry_after + 0.999))}秒后再试（本地保护等待，不保证上游届时恢复）"
             return "小黑盒要求降低请求频率，请稍后再试"
         return str(exc) or type(exc).__name__
 
@@ -591,14 +711,14 @@ class NarakaPlugin(Star):
                     return
                 args = (season_match.group(1) or "").split()
                 if len(args) > 3:
-                    yield self._note(event, "用法：永劫赛季 昵称 [模式] [当前/全部/赛季名]")
+                    yield self._note(event, "用法：永劫赛季 昵称 [模式] [当前/全部/赛季名/列表]")
                     return
                 async for message in self.stats(event, *args):
                     yield message
                 return
         if text.startswith("/"):
             text = text[1:].lstrip()
-        match = re.fullmatch(r"(战绩查询|详细查询|战绩绑定|战绩解绑)(?:\s+(.*))?", text, re.S)
+        match = re.fullmatch(r"(战绩查询|详细查询|战绩分析|战绩绑定|战绩解绑)(?:\s+(.*))?", text, re.S)
         if match is None:
             return
         if not self._allowed_group(event):
@@ -614,15 +734,24 @@ class NarakaPlugin(Star):
                 yield message
             return
 
+        force_refresh = len(args) > 1 and args[-1] in ("强制刷新", "--refresh")
+        if force_refresh:
+            args.pop()
         if len(args) > 2:
-            yield self._note(event, f"用法：{command} 昵称 [模式]")
+            yield self._note(event, f"用法：{command} 昵称 [模式] [强制刷新]")
             return
         player = args[0] if args else ""
         mode = args[1] if len(args) == 2 else ""
+        if command == "战绩分析" or (self.config.get("enable_ai_analysis", True) is True and self.config.get("ai_auto_analysis", False) is True):
+            suppress_chat = getattr(event, "should_call_llm", None)
+            if callable(suppress_chat):
+                suppress_chat(False)
         async for message in self._query_records(
             event, player, mode,
             detailed=command == "详细查询",
             force_bind=command == "战绩绑定",
+            force_refresh=force_refresh,
+            analysis=command == "战绩分析",
         ):
             yield message
 
@@ -651,18 +780,22 @@ class NarakaPlugin(Star):
     # ==================== 战绩查询 ====================
 
     async def _query_records(self, event: AstrMessageEvent, player: str, mode: str,
-                             detailed: bool = False, force_bind: bool = False):
+                             detailed: bool = False, force_bind: bool = False, force_refresh: bool = False,
+                             analysis: bool = False):
         if not self._allowed_group(event):
             return
         if not player:
-            command = "详细查询" if detailed else "战绩查询"
-            yield self._note(event, f"用法：{command} <昵称> [模式]；不填模式时自动选择最新一场排位对局的模式。")
+            command = "战绩分析" if analysis else "详细查询" if detailed else "战绩查询"
+            yield self._note(event, f"用法：{command} <昵称> [模式] [强制刷新]；不填模式时自动选择最新一场排位对局的模式。")
             return
         if looks_like_role_id(player):
             yield self._note(
                 event,
                 "本插件不支持按角色ID查询，请改用昵称；发送 永劫搜索 昵称 可以核对是哪位玩家。",
             )
+            return
+        if analysis and self.config.get("enable_ai_analysis", True) is not True:
+            yield self._note(event, "AI战绩分析已关闭，请管理员在插件配置中启用。")
             return
         if mode:
             try:
@@ -677,6 +810,9 @@ class NarakaPlugin(Star):
             yield ack
 
         if self.data_mode == "none":
+            if analysis:
+                yield self._note(event, "免登录角色名片不足以分析战绩，请先配置小黑盒登录模式。")
+                return
             if force_bind:
                 yield self._note(event, "当前为无绑定模式，不支持战绩绑定；请在插件配置里切换数据模式。")
                 return
@@ -696,79 +832,97 @@ class NarakaPlugin(Star):
             yield self._note(event, f"查询过于频繁，请 {cooldown} 秒后再试。")
             return
 
-        async with self._session() as session:
-            try:
-                await self._binding.recover(session, self._residual_interval_seconds())
-            except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                logger.warning(f"[naraka] 残留恢复失败: {type(exc).__name__}")
-
-        # ---- 阶段一：只读尝试（不占绑定锁）----
-        report = _ReadResult(nickname=player)
-        if not force_bind:
-            async with self._query_lock:
+        progress = QueryProgress(event, enabled=self.config.get("enable_query_progress", True) is True,
+                                 interval=self._number_setting("query_progress_interval_seconds", 8.0, 3.0, 120.0),
+                                 mode=self.config.get("query_progress_mode", "等待时提示一次"),
+                                 wait_seconds=self._number_setting("query_progress_wait_seconds", 15.0, 5.0, 120.0))
+        progress.start()
+        use_ai = analysis or (self.config.get("enable_ai_analysis", True) is True and self.config.get("ai_auto_analysis", False) is True)
+        async def final_note(message):
+            await progress.close()
+            return self._note(event, message)
+        try:
+            async with self._session() as session:
                 try:
-                    report = await self._run_read(player, mode, detailed)
+                    await self._binding.recover(session, self._residual_interval_seconds())
                 except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    logger.warning(f"[naraka] 残留恢复失败: {type(exc).__name__}")
                     if _must_stop_after_error(exc):
-                        yield self._note(event, f"查询失败：{self._error_text(exc)}")
+                        yield await final_note(f"查询失败：{self._error_text(exc)}")
                         return
-                    report = _ReadResult(ok=False, reason=self._error_text(exc))
-            if report.ok:
-                for index, text in enumerate(report.texts):
-                    yield await self._body(event, text, first=index == 0)
-                return
-            if not report.needs_bind:
-                yield self._note(event, report.reason or "查询失败")
-                return
 
-        # ---- 阶段二：绑定 → 再搜 → 查询 → 解绑 ----
-        nickname = report.nickname or player
-        if not self._auto_bind():
-            if force_bind:
-                yield self._note(event, "自动绑定已关闭，请在插件配置里开启「自动绑定」后再试。")
-            else:
-                yield self._note(event, f"没有找到「{nickname}」，请用 永劫搜索 核对昵称。")
-            return
-        if self._binding.negative_hit(nickname.strip().lower()):
-            yield self._note(
-                event,
-                f"「{nickname}」暂时没有可查数据，请稍后再试，或用 永劫搜索 核对昵称。",
-            )
-            return
-
-        async with self._session() as session:
-            async with self._binding.bound(session, nickname, DEFAULT_SERVER) as outcome:
-                if not outcome.ok:
-                    logger.info(
-                        f"[naraka] 兜底绑定失败 nickname={nickname!r} "
-                        f"state={outcome.state} reason={outcome.message}"
-                    )
-                    yield self._note(
-                        event, self._bind_failure_text(nickname, outcome, force_bind)
-                    )
-                else:
+            # ---- 阶段一：只读尝试（不占绑定锁）----
+            report = _ReadResult(nickname=player)
+            if not force_bind:
+                async with self._query_lock:
                     try:
-                        again = await self._run_read(player, mode, detailed)
+                        report = await self._run_read(player, mode, detailed, force_refresh=force_refresh, progress=progress, for_ai=use_ai)
                     except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                        again = _ReadResult(ok=False, reason=self._error_text(exc))
-                    if again.ok:
-                        for index, text in enumerate(again.texts):
-                            yield await self._body(event, text, first=index == 0)
-                    else:
-                        self._binding.mark_negative(nickname.strip().lower())
-                        reason = again.reason or "该昵称没有可展示的数据"
+                        if _must_stop_after_error(exc):
+                            yield await final_note(f"查询失败：{self._error_text(exc)}")
+                            return
+                        report = _ReadResult(ok=False, reason=self._error_text(exc))
+                if report.ok:
+                    if use_ai:
+                        report = await self._prepare_ai_report(event, report)
+                    for index, text in enumerate(report.texts):
+                        yield await self._body(event, text, first=index == 0, progress=progress if index == 0 else None)
+                    return
+                if not report.needs_bind:
+                    yield await final_note(report.reason or "查询失败")
+                    return
+
+            # ---- 阶段二：绑定 → 再搜 → 查询 → 解绑 ----
+            nickname = report.nickname or player
+            if not self._auto_bind():
+                if force_bind:
+                    yield await final_note("自动绑定已关闭，请在插件配置里开启「自动绑定」后再试。")
+                else:
+                    yield await final_note(f"没有找到「{nickname}」，请用 永劫搜索 核对昵称。")
+                return
+            if self._binding.negative_hit(nickname.strip().lower()):
+                yield await final_note(f"「{nickname}」暂时没有可查数据，请稍后再试，或用 永劫搜索 核对昵称。",
+                )
+                return
+
+            again = None
+            async with self._session() as session:
+                async with self._binding.bound(session, nickname, DEFAULT_SERVER) as outcome:
+                    if not outcome.ok:
                         logger.info(
-                            f"[naraka] 绑定后仍无数据 nickname={nickname!r} reason={reason}"
+                            f"[naraka] 兜底绑定失败 nickname={nickname!r} "
+                            f"state={outcome.state} reason={outcome.message}"
                         )
-                        if force_bind:
-                            yield self._note(event, f"绑定成功，查询失败：{reason}")
-                        else:
-                            yield self._note(
-                                event,
-                                f"搜索「{nickname}」成功，但没能取到数据，请稍后再试。",
+                        yield await final_note(self._bind_failure_text(nickname, outcome, force_bind)
+                        )
+                    else:
+                        try:
+                            async with self._query_lock:
+                                again = await self._run_read(player, mode, detailed, force_refresh=force_refresh, progress=progress, for_ai=use_ai)
+                        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                            again = _ReadResult(ok=False, reason=self._error_text(exc))
+                        if not again.ok:
+                            # Cache only an explicit absence, never an API/limit failure.
+                            if getattr(again, "needs_bind", False):
+                                self._binding.mark_negative(nickname.strip().lower())
+                            reason = again.reason or "该昵称没有可展示的数据"
+                            logger.info(
+                                f"[naraka] 绑定后仍无数据 nickname={nickname!r} reason={reason}"
                             )
-            if not outcome.unbind_ok:
-                yield self._note(event, f"{nickname} 解绑失败，请发送：战绩解绑 {nickname}")
+                            if force_bind:
+                                yield await final_note(f"绑定成功，查询失败：{reason}")
+                            else:
+                                yield await final_note(f"搜索「{nickname}」成功，查询失败：{reason}",
+                                )
+                if again is not None and again.ok:
+                    if use_ai:
+                        again = await self._prepare_ai_report(event, again)
+                    for index, text in enumerate(again.texts):
+                        yield await self._body(event, text, first=index == 0, progress=progress if index == 0 else None)
+                if not outcome.unbind_ok:
+                    yield await final_note(f"{nickname} 解绑失败，请发送：战绩解绑 {nickname}")
+        finally:
+            await progress.close()
 
     @staticmethod
     def _bind_failure_text(nickname: str, outcome, forced: bool) -> str:
@@ -868,7 +1022,8 @@ class NarakaPlugin(Star):
             public_rows = await self._public_search_rows(session, name, limit=20)
         except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logger.warning(f"[naraka] 免登录搜索失败: {type(exc).__name__}")
-            public_rows = []
+            # A failed request is not a successful empty search.
+            raise
 
         row, ambiguous = pick(public_rows)
         if row is not None:
@@ -885,7 +1040,7 @@ class NarakaPlugin(Star):
                     found = await self._search(session, name)
                 except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                     logger.warning(f"[naraka] 登录搜索回退失败: {type(exc).__name__}")
-                    found = []
+                    raise
                 if found:
                     logger.info(
                         f"[naraka] 免登录搜索没命中、登录搜索命中 nickname={name!r} "
@@ -901,8 +1056,14 @@ class NarakaPlugin(Star):
         logger.info(f"[naraka] 两个搜索通道都没命中 nickname={name!r} → 触发绑定兜底")
         return None, ""
 
-    async def _run_read(self, player: str, mode: str, detailed: bool) -> _ReadResult:
+    async def _run_read(self, player: str, mode: str, detailed: bool, *, force_refresh: bool = False, progress=None, for_ai=False) -> _ReadResult:
         """只读查询：定位角色 → 更新 → 取列表 → 取详情 → 出报告。"""
+        queried_at = time.time()
+        configured_season = _configured_season(self.config.get("season_mappings", []))
+        list_season = configured_season[0] if configured_season else "pre-01"
+        recent_season_name = configured_season[1] if configured_season else "全部赛季"
+        if progress:
+            await progress("正在搜索玩家并确认角色…" + ("（本次强制刷新详情缓存）" if force_refresh else ""), force=True)
         detail_mode = self._detail_query_mode()
         async with self._session() as session:
             selected, reason = await self._resolve_player(session, player)
@@ -926,42 +1087,86 @@ class NarakaPlugin(Star):
                 ),
             }
 
-            if self._refresh_enabled():
+            if self._refresh_enabled() or force_refresh:
+                if progress:
+                    await progress("角色已确认，正在请求上游更新数据…")
                 await self._refresh(session, role_id, server)
 
             query_limit = self._count_setting("query_match_count", 30)
             selection_limit = self._count_setting("selected_match_count", 10)
-            rows = await self._fetch_recent_pool(session, common, query_limit)
-            if not rows:
-                return _ReadResult(ok=False, role_id=role_id, server=server, nickname=name,
-                                   reason=f"{name}：查询到对局 0 场。")
+            requested_mode = resolve_mode(mode) if mode else "12"
+            fallback_notice = ""
+            scope_home_error = None
+            scope_stopped = False
+            if progress:
+                await progress("正在读取所选赛季的对局列表、赛季目录和概览…", force=True)
+            # Decide the effective scope before requesting details. If its list
+            # or primary overview fails, discard that scope and retry all-season
+            # inputs once, so a report cannot mix two seasons.
+            for attempt in range(2):
+                phase = "list"
+                home = None
+                try:
+                    rows = await self._fetch_recent_pool(session, common, query_limit, battle_tid=requested_mode, season=list_season)
+                    pool_modes = match_mode_counts(rows)
+                    if not rows and detailed:
+                        return _ReadResult(ok=False, role_id=role_id, server=server, nickname=name,
+                                           reason=f"{fallback_notice}\n{name}：{recent_season_name}查询到对局 0 场。".strip())
 
-            mode_id, matches = select_matches(rows, mode, selection_limit)
-            if mode_id is None:
-                return _ReadResult(
-                    ok=False, role_id=role_id, server=server, nickname=name,
-                    reason=f"查询到对局 {len(rows)} 场；排除快速等非排位模式后，没有可自动选择的天人或天选对局。",
-                )
-            if not matches:
-                return _ReadResult(
-                    ok=False, role_id=role_id, server=server, nickname=name,
-                    reason=f"查询到对局 {len(rows)} 场；其中没有{MODES[mode_id]}对局。",
-                )
+                    mode_id, matches = select_matches(rows, mode, selection_limit)
+                    if mode_id is None:
+                        return _ReadResult(
+                            ok=False, role_id=role_id, server=server, nickname=name,
+                            reason=f"{fallback_notice}\n{recent_season_name}查询到对局 {len(rows)} 场；排除快速等非排位模式后，没有可自动选择的天人或天选对局。".strip(),
+                        )
+                    if not matches and detailed:
+                        return _ReadResult(
+                            ok=False, role_id=role_id, server=server, nickname=name,
+                            reason=f"{fallback_notice}\n{recent_season_name}查询到对局 {len(rows)} 场；其中没有{MODES[mode_id]}对局。".strip(),
+                        )
+
+                    phase = "home"
+                    home = await self._home_data(session, common, mode_id, list_season)
+                    if configured_season and str(home.get("battle_tid") or mode_id) != mode_id:
+                        raise ValueError("接口返回模式与所选模式不一致，未展示赛季数据")
+                except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    if configured_season and list_season != "pre-01" and not _must_stop_after_error(exc) and attempt == 0:
+                        fallback_notice = f"所选赛季「{configured_season[1]}」查询失败，本次已自动切换为全部赛季；WebUI选择未改变。"
+                        configured_season = ("pre-01", "全部赛季")
+                        list_season, recent_season_name = configured_season
+                        logger.warning("[naraka] selected season %s failed; retrying all seasons: %s", phase, type(exc).__name__)
+                        continue
+                    if phase == "list":
+                        if fallback_notice:
+                            return _ReadResult(ok=False, role_id=role_id, server=server, nickname=name,
+                                               reason=f"{fallback_notice}\n全部赛季查询也失败：{self._error_text(exc)}")
+                        raise
+                    home = None
+                    scope_home_error = exc
+                    scope_stopped = _must_stop_after_error(exc)
+                    logger.warning("[naraka] season overview failed: %s", type(exc).__name__)
+                break
 
             detail_enabled = detail_mode == "全部开启" or (
                 detail_mode == "仅详细查询" and detailed
             )
             records = []
             failures = 0
-            stopped = False
+            stopped = scope_stopped
+            if progress:
+                await progress(f"已获取对局列表，选中{len(matches)}场。" + (f"正在获取详情：0/{len(matches)}。" if detail_enabled else "当前配置仅使用列表数据。"), force=True)
             if not detail_enabled:
                 # 当前查询不请求单局详情，只展示列表级数据
                 for row in matches:
                     records.append(make_record(row, {}))
             else:
-                for row in matches:
+                for detail_index, row in enumerate(matches, 1):
+                    if stopped:
+                        break
                     match_id = str(row["match_id"])
                     cache_key = (role_id, match_id)
+                    if force_refresh:
+                        self._detail_cache.pop(cache_key, None)
                     detail = self._detail_cache.get(cache_key)
                     if detail is None:
                         try:
@@ -975,51 +1180,103 @@ class NarakaPlugin(Star):
                                 stopped = True
                                 break
                             logger.warning(f"[naraka] detail failed: {type(exc).__name__}")
+                            if progress:
+                                await progress(f"已处理对局详情：{detail_index}/{len(matches)}（失败{failures}场）")
                             continue
                     records.append(make_record(row, detail))
+                    if progress:
+                        await progress(f"已处理对局详情：{detail_index}/{len(matches)}（成功{len(records)}场，失败{failures}场）")
 
             hero_names: dict[str, str] = dict(KNOWN_HERO_NAMES)
             scores: dict[str, str] = {}
-            if not stopped:
+            current_season: dict = {}
+            season_key, season_name = configured_season or ("pre-01", "")
+            season_error = "所选赛季数据未获取" if configured_season else "当前赛季数据未获取"
+            season_notice = fallback_notice
+            if scope_home_error is not None:
+                season_error = "赛季概览获取失败，请稍后重试"
+                if configured_season is None:
+                    season_name = ""
+            if not stopped and home is not None:
                 try:
-                    home = await self._home_data(session, common, "12", "pre-01")
                     hero_names.update({
                         str(item["hero_id"]): str(item["name"])
                         for item in home.get("heroes", [])
                         if isinstance(item, dict) and item.get("hero_id") and item.get("name")
                     })
-                    season_key, _ = _choose_season(home.get("seasons"), "当前")
+                    if configured_season is None:
+                        try:
+                            season_key, season_name = _choose_season(home.get("seasons"), "当前")
+                        except ValueError as exc:
+                            # Only automatic detection may reuse all-season data.
+                            season_key, season_name = "pre-01", "全部赛季"
+                            if not detailed:
+                                season_notice = "未能确认当前赛季，以下展示接口返回的全部赛季数据，不能当作当前赛季统计。"
+                            logger.warning("[naraka] current season unavailable; using all seasons: %s", exc)
                 except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                    logger.warning(f"[naraka] hero catalog failed: {type(exc).__name__}")
-                    season_key = "pre-01"
+                    logger.warning(f"[naraka] season catalog detection failed: {type(exc).__name__}")
+                    if configured_season:
+                        season_error = "赛季概览获取失败，请稍后重试"
+                    else:
+                        season_error = str(exc) if isinstance(exc, ValueError) else "获取赛季列表失败，请稍后重试"
+                        season_name = ""
+                        season_key = "pre-01"
                     if _must_stop_after_error(exc):
                         stopped = True
-                if not detailed and not stopped and season_key != "pre-01":
-                    for ranked_id in ("5000000", "12", "5000001", "4", "13", "5"):
+                if not detailed and not stopped and season_name and home is not None:
+                    # Fetch the selected mode first and reuse it for both the
+                    # season overview and the six-mode score summary.
+                    for ranked_id in dict.fromkeys((mode_id, "5000000", "12", "5000001", "4", "13", "5")):
                         try:
-                            season_body = await self._home_data(session, common, ranked_id, season_key)
+                            season_body = home if season_key == list_season and ranked_id == mode_id else await self._home_data(session, common, ranked_id, season_key)
+                            returned_mode = str(season_body.get("battle_tid") or ranked_id)
+                            if returned_mode != ranked_id:
+                                if ranked_id == mode_id:
+                                    season_error = "接口返回模式与所选模式不一致，未展示赛季数据"
+                                continue
+                            if ranked_id == mode_id:
+                                current_season = season_body
+                                season_error = ""
                             rating = str((season_body.get("player_info") or {}).get("rating") or "")
                             if rating.isdigit() and int(rating) > 0:
                                 scores[ranked_id] = rating
                         except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                             logger.warning(f"[naraka] season mode failed: {type(exc).__name__}")
+                            if ranked_id == mode_id:
+                                season_error = "当前模式赛季数据获取失败，请稍后重试"
                             if _must_stop_after_error(exc):
                                 stopped = True
                                 break
 
         hero_names = apply_hero_mappings(hero_names, records, self.config.get("hero_mappings", []))
         total = len(rows)
+        image_output = str(self.config.get("result_display_format", "文字") or "文字").strip() in ("图片", "image")
         if detailed:
             report = format_details(name, total, mode_id, len(matches), records, hero_names,
-                                    failures, role_id=role_id, list_only=not detail_enabled)
-            texts = split_detail_report(report)
+                                    failures, role_id=role_id, list_only=not detail_enabled,
+                                    queried_at=queried_at, samples=matches, recent_season_name=recent_season_name,
+                                    query_notice=season_notice)
+            if configured_season and home is None:
+                report += "\n" + season_error
+            texts = [report] if image_output else split_detail_report(report)
         else:
             report = format_summary(name, total, mode_id, len(matches), records, scores,
-                                    hero_names, failures, role_id=role_id)
-            texts = [report]
+                                    hero_names, failures, role_id=role_id,
+                                    season_body=current_season, season_name=season_name,
+                                    season_error=season_error, season_notice=season_notice, queried_at=queried_at,
+                                    samples=matches, pool_modes=pool_modes, recent_season_name=recent_season_name)
+            texts = [report] if image_output else _split_lines(report.splitlines())
         if stopped:
-            texts[-1] = texts[-1] + "\n小黑盒要求重新登录或限制请求，已停止后续查询。"
-        return _ReadResult(ok=True, texts=texts, role_id=role_id, server=server, nickname=name)
+            stopped_note = "\n小黑盒要求重新登录或限制请求，已停止后续查询。"
+            texts[-1] += stopped_note
+            report += stopped_note
+        analysis_data = build_analysis_data(mode_id, len(matches), records, hero_names,
+            season_body=current_season, season_name=season_name, season_error=season_error, season_notice=season_notice,
+            queried_at=queried_at, samples=matches, failed=failures, fetched=total, requested=query_limit,
+            detail_enabled=detail_enabled, stopped=stopped, pool_modes=pool_modes,
+            recent_season_name=recent_season_name) if for_ai else {}
+        return _ReadResult(ok=True, texts=texts, role_id=role_id, server=server, nickname=name,
+                           report_text=report, analysis_data=analysis_data)
 
     async def _refresh(self, session, role_id: str, server: str) -> None:
         """「更新数据」按钮：非致命，失败只记日志。"""
@@ -1028,6 +1285,8 @@ class NarakaPlugin(Star):
                 body = await self._api.update(session, role_id, server)
         except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logger.warning(f"[naraka] update failed: {type(exc).__name__}")
+            if _must_stop_after_error(exc):
+                raise
             return
         state = str(body.get("state") or "")
         for _ in range(3):
@@ -1039,13 +1298,15 @@ class NarakaPlugin(Star):
                     body = await self._api.update(session, role_id, server)
             except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 logger.warning(f"[naraka] update retry failed: {type(exc).__name__}")
+                if _must_stop_after_error(exc):
+                    raise
                 return
             state = str(body.get("state") or "")
         if state == "failed":
             logger.info(f"[naraka] update reported failed: {body.get('btn_desc') or ''}")
 
-    async def _fetch_recent_pool(self, session, common: dict, limit: int) -> list[dict]:
-        """Read successive mixed pages; stop if upstream repeats a page.
+    async def _fetch_recent_pool(self, session, common: dict, limit: int, *, battle_tid: str = "12", season: str = "pre-01") -> list[dict]:
+        """Request the chosen mode and season on every page.
 
         分页参数由配置「对局列表分页参数」决定：offset（limit/offset，默认）或 page（page/page_size）。
         """
@@ -1064,8 +1325,8 @@ class NarakaPlugin(Star):
                     limit=page_size,
                     offset=offset,
                     pagination=pagination,
-                    battle_tid="12",
-                    season="pre-01",
+                    battle_tid=battle_tid,
+                    season=season,
                     heybox_id=common.get("heybox_id", ""),
                 )
             batch = recent_rows(body, limit)
@@ -1083,7 +1344,7 @@ class NarakaPlugin(Star):
     async def _fetch_detail(self, session, common: dict, row: dict) -> dict:
         match_id = str(row["match_id"])
         async with self._paced(detail=True):
-            payload = await self._api.match_detail(
+            payload = await self._diagnosed_call("detail", str(row.get("battle_tid") or ""), "", lambda: self._api.match_detail(
                 session,
                 match_id,
                 role_id=common["role_id"],
@@ -1091,21 +1352,28 @@ class NarakaPlugin(Star):
                 battle_tid=str(row.get("battle_tid") or ""),
                 scene=str(row.get("scene") or ""),
                 heybox_id=common.get("heybox_id", ""),
-            )
+            ))
         if not isinstance(payload.get("data"), list):
             raise ValueError("单局详情缺少数据")
         return payload
 
     async def _home_data(self, session, common: dict, battle_tid: str, season: str) -> dict:
         async with self._paced():
-            return await self._api.home_data(
+            body = await self._diagnosed_call("home", battle_tid, season, lambda: self._api.home_data(
                 session,
                 common["role_id"],
                 server=common["server"],
                 season=season,
                 battle_tid=battle_tid,
                 heybox_id=common.get("heybox_id", ""),
-            )
+            ))
+        if isinstance(body.get("seasons"), list) and body["seasons"]:
+            try:
+                await self._remember_season_catalog(body["seasons"])
+            except ValueError as exc:
+                # Catalog persistence must not discard a valid battle report.
+                logger.warning(f"[naraka] season catalog collection failed: {exc}")
+        return body
 
     # ==================== 赛季总览 ====================
 
@@ -1114,7 +1382,7 @@ class NarakaPlugin(Star):
         if not self._allowed_group(event):
             return
         if not player:
-            yield self._note(event, "用法：永劫赛季 昵称 [模式] [当前/全部/赛季名]")
+            yield self._note(event, "用法：永劫赛季 昵称 [模式] [当前/全部/赛季名/列表]")
             return
         if looks_like_role_id(player):
             yield self._note(
@@ -1154,7 +1422,11 @@ class NarakaPlugin(Star):
                 yield message
 
     async def _season_report(self, event: AstrMessageEvent, player: str, mode_id: str | None, season: str):
+        queried_at = time.time()
+        fallback_notice = ""
         try:
+            configured_season = _configured_season(self.config.get("season_mappings", [])) if season == "当前" else None
+            initial_season = configured_season[0] if configured_season else "pre-01"
             async with self._session() as session:
                 selected, reason = await self._resolve_player(session, player)
                 if selected is None:
@@ -1175,38 +1447,94 @@ class NarakaPlugin(Star):
                     ),
                 }
                 if mode_id is None:
-                    rows = await self._fetch_recent_pool(
-                        session, common, self._count_setting("query_match_count", 30)
-                    )
+                    try:
+                        rows = await self._fetch_recent_pool(
+                            session, common, self._count_setting("query_match_count", 30), season=initial_season
+                        )
+                    except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                        if not configured_season or initial_season == "pre-01" or _must_stop_after_error(exc):
+                            raise
+                        fallback_notice = f"所选赛季「{configured_season[1]}」查询失败，本次已自动切换为全部赛季；WebUI选择未改变。"
+                        configured_season = ("pre-01", "全部赛季")
+                        initial_season = "pre-01"
+                        rows = await self._fetch_recent_pool(
+                            session, common, self._count_setting("query_match_count", 30), season=initial_season
+                        )
                     mode_id, _ = select_matches(rows, "", 1)
                     if mode_id is None:
-                        yield self._note(event, "近期对局中没有可自动选择的天人或天选模式，请指定模式后重试。")
+                        yield self._note(event, (fallback_notice + "\n近期对局中没有可自动选择的天人或天选模式，请指定模式后重试。").strip())
                         return
-                all_seasons = await self._home_data(session, common, mode_id, "pre-01")
-                season_key, season_name = _choose_season(all_seasons.get("seasons"), season)
-                if season_key == "pre-01":
-                    body = all_seasons
+                try:
+                    home = await self._home_data(session, common, mode_id, initial_season)
+                    if configured_season and str(home.get("battle_tid") or mode_id) != mode_id:
+                        raise ValueError("接口返回模式与所选模式不一致，未展示赛季数据")
+                except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    if not configured_season or initial_season == "pre-01" or _must_stop_after_error(exc):
+                        raise
+                    fallback_notice = f"所选赛季「{configured_season[1]}」查询失败，本次已自动切换为全部赛季；WebUI选择未改变。"
+                    configured_season = ("pre-01", "全部赛季")
+                    initial_season = "pre-01"
+                    home = await self._home_data(session, common, mode_id, initial_season)
+                if season in ("列表", "赛季列表"):
+                    options = home.get("seasons")
+                    entries = [item for item in options if isinstance(item, dict) and item.get("key")] if isinstance(options, list) else []
+                    lines = [*format_identity(name, role_id), *format_query_metadata(queried_at),
+                             f"{MODES.get(mode_id, mode_id)}｜接口赛季列表（共{len(entries)}项，返回顺序不代表新旧）"]
+                    for item in entries:
+                        flags = "，".join(f"{key}={item[key]}" for key in ("is_current", "current", "selected") if key in item)
+                        lines.append(f"{item.get('value') or '未命名'}｜ID：{item['key']}" + (f"｜{flags}" if flags else ""))
+                    configured = self.config.get("season_mappings", [])
+                    if configured:
+                        lines.append("WebUI 手动配置（不代表接口已验证支持）：")
+                        for item in merge_season_options([], configured):
+                            lines.append(f"{item['value']}｜ID：{item['key']}" + ("｜WebUI用于查询" if item.get("_manual_current") else ""))
+                    if not entries:
+                        lines.append("接口未返回赛季选项。")
+                    lines.append("selected 仅表示默认选中，不视为当前赛季；未列出的新赛季暂不能从此列表选择。")
+                    for chunk in _split_lines(lines):
+                        yield self._note(event, chunk)
+                    return
+                season_key, season_name = configured_season or _choose_season(home.get("seasons"), season, self.config.get("season_mappings", []))
+                if season_key == initial_season:
+                    body = home
                 else:
-                    body = await self._home_data(session, common, mode_id, season_key)
+                    try:
+                        body = await self._home_data(session, common, mode_id, season_key)
+                        if str(body.get("battle_tid") or mode_id) != mode_id:
+                            raise ValueError("接口返回模式与所选模式不一致，未展示赛季数据")
+                    except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                        if _must_stop_after_error(exc):
+                            raise
+                        fallback_notice = f"指定赛季「{season_name}」查询失败，本次已自动切换为全部赛季。"
+                        season_key, season_name = "pre-01", "全部赛季"
+                        body = home
 
+            returned_mode = str(body.get("battle_tid") or mode_id)
+            if returned_mode != mode_id:
+                raise ValueError("接口返回模式与所选模式不一致，未展示赛季数据")
+            body, rank_note = normalize_rank_data(mode_id, body)
             info = body.get("player_info") or {}
             overview = body.get("overview") or []
-            returned_mode = str(body.get("battle_tid") or mode_id)
             mode_name = MODES.get(returned_mode, f"模式 {returned_mode}")
             if isinstance(info, dict) and _has_value(info.get("name")):
                 name = str(info["name"])
-            lines = [*format_identity(name, role_id), f"{mode_name}｜{season_name}"]
+            lines = [*format_identity(name, role_id), *format_query_metadata(queried_at), f"{mode_name}｜{season_name}"]
+            if fallback_notice:
+                lines.append(fallback_notice)
             if isinstance(info, dict):
                 for key, label in (("rating", "分数"), ("level", "段位"), ("lv", "等级")):
+                    if key == "level" and info.get(key) is None and rank_note:
+                        lines.append("段位：待确认")
                     if _has_value(info.get(key)):
                         lines.append(f"{label}：{info[key]}")
             if isinstance(overview, list):
                 for item in overview:
                     if isinstance(item, dict) and _has_value(item.get("desc")) and _has_value(item.get("value")):
                         lines.append(f"{item['desc']}：{item['value']}")
+            if rank_note:
+                lines.append(rank_note)
             for index, chunk in enumerate(_split_lines(lines)):
                 yield await self._body(event, chunk, first=index == 0)
         except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-            yield self._note(event, f"查询失败：{self._error_text(exc)}")
-        except ValueError as exc:
-            yield self._note(event, f"查询失败：{exc}")
+            for chunk in _split_lines((f"{fallback_notice}\n查询失败：{self._error_text(exc)}").strip().splitlines()):
+                yield self._note(event, chunk)

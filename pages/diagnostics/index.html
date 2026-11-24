@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>数据诊断 · 永劫无间</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+  <header><div><p class="eyebrow">永劫无间 · 管理员工具</p><h1>数据诊断</h1><p class="muted">核对接口实际返回的赛季与指标，识别零值和缺失数据。</p></div><span id="count" class="badge">正在连接</span></header>
+  <div id="notice" role="status" aria-live="polite">正在连接 AstrBot…</div>
+  <section class="help"><strong>自动采集 · 不额外请求接口</strong><p>先在机器人中查询战绩、详细战绩或赛季，也可在“英雄与赛季”中同步赛季，再点击刷新。仅保留最近50次主页和单局详情请求的脱敏摘要；重载插件后清空。</p><p>不记录登录凭证、玩家昵称、角色ID、对局ID、请求签名或原始响应。缓存命中不会产生新记录。返回成功仅表示请求完成，不代表数据完整或准确。</p></section>
+  <section class="toolbar"><label class="history">请求记录<select id="record" disabled aria-label="选择接口请求记录"></select></label><div class="actions"><button id="refresh" disabled>刷新诊断</button><button id="clear" disabled>清空记录</button></div></section>
+  <section class="panel"><h2>战绩缓存</h2><p>内存中有 <strong id="cache-count">0</strong> 条单局详情缓存。清空后，下次查询会按当前配置重新请求详情，不影响登录、英雄和赛季配置。</p><p class="muted">也可发送“战绩查询 昵称 [模式] 强制刷新”或“详细查询 昵称 [模式] 强制刷新”，仅绕过本次选中对局的缓存并请求上游更新；不绕过冷却和限频。</p><button id="clear-cache" disabled>清空战绩缓存</button></section>
+  <p id="empty" class="empty" hidden>暂无记录。请先发起一次查询或赛季同步，再刷新诊断。</p>
+  <div id="detail" hidden>
+    <section class="panel"><h2>请求摘要</h2><dl id="metadata"></dl><div id="fields" class="chips"></div><p id="error" class="error" hidden></p></section>
+    <section id="season-panel" class="panel"><h2>接口赛季目录 <span id="season-count" class="muted"></span></h2><p class="muted">原始接口名称与编码，不套用 WebUI 映射；selected 只代表默认选中，不能证明它是当前赛季。</p><p id="season-warning" class="error" hidden></p><div class="table-wrap"><table><thead><tr><th>编码</th><th>接口名称</th><th>selected</th><th>is_current</th><th>current</th></tr></thead><tbody id="seasons"></tbody></table></div></section>
+    <section id="metric-panel" class="panel"><h2>接口指标</h2><label class="search">筛选指标<input id="search" type="search" placeholder="例如：振刀、伤害" aria-label="筛选接口指标"></label><p id="metric-hint" class="muted"></p><p id="metric-warning" class="error" hidden></p><div class="table-wrap"><table><thead><tr><th>接口指标名称</th><th>返回值</th><th>状态</th></tr></thead><tbody id="metrics"></tbody></table></div><p class="muted">“返回零值”不等于确认实际战绩为零。为定位缺失，主页额外检查场均伤害、场均振刀、场均击杀；单局额外检查总伤害、振刀、击杀。别名可能导致检查项未匹配，需结合实际返回的名称判断。</p></section>
+  </div>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "views": {
+    "mappings": {
+      "title": "Heroes & Seasons",
+      "description": "Manage hero and season mappings and choose the active season."
+    },
+    "diagnostics": {
+      "title": "Data Diagnostics",
+      "description": "Inspect sanitized season catalogs, metrics, missing fields and request times."
+    }
+  },
+  "pages": {
+    "mappings": {
+      "title": "Heroes & Seasons",
+      "description": "Manage hero and season mappings and choose the active season."
+    },
+    "diagnostics": {
+      "title": "Data Diagnostics",
+      "description": "Inspect sanitized season catalogs, metrics, missing fields and request times."
+    }
+  }
+}

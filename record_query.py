@@ -1,14 +1,17 @@
 """Select and summarize recent Xiaoheihe NARAKA match records.
 
-The match-list endpoint returns a mixed, time-ordered pool even when given a
-mode. Its rows carry exact damage, while detail.data contains display values.
+The match-list endpoint may return a mixed pool even when given a mode. Check
+each returned row; list damage is exact, while detail.data contains display values.
 """
 
 from __future__ import annotations
 
 import re
+import math
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+BEIJING = timezone(timedelta(hours=8))
 
 
 MODES = {
@@ -23,6 +26,62 @@ MODES = {
     "5000010": "无尽试炼",
 }
 RANKED_IDS = frozenset(("4", "13", "5", "5000000", "12", "5000001"))
+TIANREN_IDS = frozenset(("4", "13", "5"))
+TIANXUAN_RANK_NAMES = ("青铜", "白银", "黄金", "铂金", "陨星", "蚀月", "坠日",
+                       "无间修罗", "无双修罗", "无相龙王", "无量梵天")
+
+
+def normalize_rank_data(mode_id: str, body: dict | None) -> tuple[dict, str]:
+    """Keep API ranks mode-specific; never infer a Tianren rank from ranked tiers.
+
+    The PC game renamed Tianren ranks on 2025-07-24. Its 2026-10 season
+    announcement still distinguishes 星月宗师 from the Tianxuan ranks above.
+    https://www.yjwujian.cn/news/update/20250710/33456_1246358.html
+    https://www.yjwujian.cn/news/update/20261010/33456_1316200.html
+    Neither announcement supplies a complete current score-to-rank table, so
+    do not substitute a mobile table or guess a rank from rating.
+    """
+    source = body if isinstance(body, dict) else {}
+    if str(mode_id) not in TIANREN_IDS:
+        return source, ""
+    result = dict(source)
+    rejected = []
+
+    def validate(value):
+        if value is None or isinstance(value, str) and not value.strip():
+            return value
+        if isinstance(value, str):
+            if any(name in value for name in TIANXUAN_RANK_NAMES):
+                rejected.append("mode")
+                return None
+            if not re.fullmatch(r"[\d.\s]+", value):
+                return value
+        rejected.append("code")
+        return None
+
+    info = source.get("player_info")
+    if isinstance(info, dict):
+        result["player_info"] = dict(info)
+        if "level" in info:
+            result["player_info"]["level"] = validate(info["level"])
+    overview = source.get("overview")
+    if isinstance(overview, list):
+        result["overview"] = []
+        for item in overview:
+            if not isinstance(item, dict):
+                result["overview"].append(item)
+                continue
+            item = dict(item)
+            label = str(item.get("desc") or "")
+            if "段位" in label and not any(word in label for word in ("积分", "分数", "变化", "排名")):
+                item["value"] = validate(item.get("value"))
+            result["overview"].append(item)
+    note = ""
+    if "mode" in rejected:
+        note = "接口返回了天选之人的段位名称，无法据此确认天人之战段位；已保留分数和其他统计。"
+    elif rejected:
+        note = "接口未返回可确认的天人段位名称；已保留分数和其他统计，不按积分猜测段位。"
+    return result, note
 
 # 裸写模式：不带"天选/天人"前缀时，固定归到天选
 BARE_MODES = {
@@ -126,6 +185,16 @@ def select_matches(rows: list[dict], requested_mode: str = "", limit: int = 10) 
     return mode_id, [row for row in rows if str(row.get("battle_tid")) == mode_id][:limit]
 
 
+def match_mode_counts(rows: list[dict]) -> dict[str, int]:
+    """Expose the returned pool's actual mode distribution, including unknown IDs."""
+    counts = Counter()
+    for row in rows:
+        code = str(row.get("battle_tid") or "")
+        label = MODES.get(code) or (f"未识别模式（编码{code}）" if re.fullmatch(r"\d{1,15}", code) else "未标明模式")
+        counts[label] += 1
+    return dict(counts.most_common())
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -149,6 +218,48 @@ def _metric(detail: dict, label: str) -> float | None:
     return None
 
 
+def _timestamp_ms(value: object) -> float | None:
+    """Accept plausible epoch seconds/milliseconds, never durations or bad dates."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", value):
+        return None
+    try:
+        number = _number(value)
+    except (ValueError, OverflowError):
+        return None
+    if number is None or not math.isfinite(number) or number <= 0:
+        return None
+    milliseconds = number if number >= 1e12 else number * 1000
+    try:
+        stamp = datetime.fromtimestamp(milliseconds / 1000, BEIJING)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return milliseconds if 2000 <= stamp.year <= 2100 else None
+
+
+def format_query_metadata(queried_at: float | None = None) -> list[str]:
+    stamp = datetime.now(BEIJING) if queried_at is None else datetime.fromtimestamp(queried_at, BEIJING)
+    return [f"查询时间（北京时间）：{stamp:%Y-%m-%d %H:%M:%S}",
+            "数据更新时间：未知（不以查询时间代替）"]
+
+
+def format_sample_period(records: list[dict], selected: int, samples: list[dict] | None = None) -> str:
+    """Use the selected mode's sample, including rows whose detail request failed."""
+    prefix = "近期样本时间范围（北京时间）："
+    if not selected:
+        return prefix + "无选中对局"
+    times = [_timestamp_ms(item.get("time")) for item in (records if samples is None else samples)]
+    available = [value for value in times if value is not None]
+    coverage = f"{len(available)}/{selected}场有有效时间"
+    if not available:
+        return prefix + f"未知（{coverage}）"
+    start, end = (datetime.fromtimestamp(value / 1000, BEIJING).strftime("%Y-%m-%d %H:%M")
+                  for value in (min(available), max(available)))
+    partial = "，范围仅覆盖有时间的对局" if len(available) < selected else ""
+    return prefix + f"{start} 至 {end}（{coverage}{partial}）"
+
+
 def _match_time(row: dict, detail: dict) -> float | None:
     """从详情数据里找对局时间戳。优先 detail.data 里 desc 含"时间"的项。"""
     entries = detail.get("data")
@@ -158,17 +269,10 @@ def _match_time(row: dict, detail: dict) -> float | None:
                 continue
             desc = str(entry.get("desc") or "")
             if "时间" in desc:
-                ts = _number(entry.get("value"))
-                if ts and ts > 0:
-                    # 秒级时间戳 ×1000 转毫秒
-                    if ts < 1e12:
-                        ts *= 1000
+                ts = _timestamp_ms(entry.get("value"))
+                if ts is not None:
                     return ts
-    # fallback：detail.time / row.time 都是秒级时间戳，转毫秒
-    ts = _number(detail.get("time")) or _number(row.get("time"))
-    if ts and ts < 1e12:
-        ts *= 1000
-    return ts
+    return _timestamp_ms(detail.get("time")) or _timestamp_ms(row.get("time"))
 
 
 def _whole(value: float | None, unit: str = "") -> str:
@@ -199,8 +303,6 @@ def make_record(row: dict, detail: dict) -> dict:
         share = _number(item.get("per"))
         if share is not None:
             part += f"{share * 100:.0f}%"
-        if item.get("damage") is not None:
-            part += f"/伤害{_integer(_number(item['damage']))}"
         weapons.append(part)
     return {
         "time": _match_time(row, detail),
@@ -272,18 +374,64 @@ def _hero_label(hero_id: object, hero_names: dict[str, str]) -> str:
 
 def format_summary(player_name: str, total: int, mode_id: str, selected: int,
                    records: list[dict], scores: dict[str, str], hero_names: dict[str, str],
-                   failed: int = 0, role_id: object = "") -> str:
+                   failed: int = 0, role_id: object = "", *,
+                   season_body: dict | None = None, season_name: str = "",
+                   season_error: str = "", season_notice: str = "", queried_at: float | None = None,
+                   samples: list[dict] | None = None, pool_modes: dict[str, int] | None = None,
+                   recent_season_name: str = "") -> str:
     label = MODES.get(mode_id, f"模式 {mode_id}")
     lines = [
         *format_identity(player_name, role_id),
+        *format_query_metadata(queried_at),
         f"排位：{_score(scores, '5000000')} {_score(scores, '12')} {_score(scores, '5000001')}",
         f"天人：{_score(scores, '4')} {_score(scores, '13')} {_score(scores, '5')}",
         f"当前模式：{label}",
         f"当前模式分数：{_score(scores, mode_id)}",
+    ]
+    overview_title = ("全部赛季概览" if season_name == "全部赛季" else
+                      "指定赛季概览" if season_name.endswith("（WebUI配置）") else "当前赛季概览")
+    lines.append(f"{overview_title}｜{season_name or '赛季未知'}｜{label}")
+    if season_notice:
+        lines.append(season_notice)
+    if season_error:
+        lines.append(season_error)
+    else:
+        body, rank_note = normalize_rank_data(mode_id, season_body)
+        info = body.get("player_info")
+        season_lines = []
+        if isinstance(info, dict):
+            for key, title in (("rating", "分数"), ("level", "段位"), ("lv", "等级")):
+                value = info.get(key)
+                if key == "level" and value is None and rank_note:
+                    season_lines.append("段位：待确认")
+                if value is not None and str(value).strip():
+                    season_lines.append(f"{title}：{value}")
+        overview = body.get("overview")
+        if isinstance(overview, list):
+            for item in overview:
+                if not isinstance(item, dict):
+                    continue
+                desc, value = item.get("desc"), item.get("value")
+                if desc is not None and str(desc).strip() and value is not None and str(value).strip():
+                    season_lines.append(f"{desc}：{value}")
+        empty_message = ("接口未返回全部赛季统计" if season_name == "全部赛季" else
+                         "接口未返回指定赛季统计" if season_name.endswith("（WebUI配置）") else "接口未返回当前赛季统计")
+        lines.extend(season_lines or [empty_message])
+        if rank_note:
+            lines.append(rank_note)
+    lines.extend([
+        "近期对局汇总（以下统计仅基于本次筛选的对局）：",
+        *([f"对局赛季范围：{recent_season_name}"] if recent_season_name else []),
+        format_sample_period(records, selected, samples),
         f"查询最近场次：{total}",
         f"选中对局：{selected}",
         f"有效对局：{len(records)}",
-    ]
+    ])
+    if not selected:
+        lines.append(f"本次读取的最近{total}场对局中没有选中{label}对局，不代表该模式历史没有战绩。"
+                     if total else "本次近期对局列表返回0场，不代表历史战绩为空；赛季概览与近期样本分别统计。")
+        if pool_modes:
+            lines.append("本次列表模式分布为 " + "、".join(f"{name}{count}场" for name, count in pool_modes.items()) + "。")
     if failed:
         lines.append(f"详情失败：{failed}（未计入场均）")
     counts = Counter(_hero_label(record.get("hero_id"), hero_names) for record in records)
@@ -293,20 +441,26 @@ def format_summary(player_name: str, total: int, mode_id: str, selected: int,
             lines.append(f"{index}、{hero_name}  {count}场")
     else:
         lines.append("暂无")
-    count = len(records)
-    lines.extend((
-        f"最近{count}场场均伤害：{_whole(_average(records, 'damage'))}",
-        f"最近{count}场场均振刀：{_whole(_average(records, 'parry'))}",
-        f"最近{count}场场均击败：{_whole(_average(records, 'kills'))}",
-    ))
+    for key, title in (("damage", "伤害"), ("parry", "振刀"), ("kills", "击败")):
+        available = sum(record.get(key) is not None for record in records)
+        lines.append(
+            f"最近{selected}场场均{title}：{_whole(_average(records, key))}"
+            f"（{available}/{selected}场有数据）"
+        )
     return "\n".join(lines)
 
 
 def format_details(player_name: str, total: int, mode_id: str,
                    selected: int, records: list[dict], hero_names: dict[str, str],
-                   failed: int = 0, role_id: object = "", list_only: bool = False) -> str:
+                   failed: int = 0, role_id: object = "", list_only: bool = False, *,
+                   queried_at: float | None = None, samples: list[dict] | None = None,
+                   recent_season_name: str = "", query_notice: str = "") -> str:
     label = MODES.get(mode_id, f"模式 {mode_id}")
     lines = [*format_identity(player_name, role_id),
+             *format_query_metadata(queried_at),
+             *([f"对局赛季范围：{recent_season_name}"] if recent_season_name else []),
+             *([query_notice] if query_notice else []),
+             format_sample_period(records, selected, samples),
              f"查询到对局 {total} 场｜模式：{label}",
              f"选中 {selected} 场｜有效对局 {len(records)} 场"]
     if failed:
@@ -314,16 +468,34 @@ def format_details(player_name: str, total: int, mode_id: str,
     if not records:
         return "\n".join(lines + ["暂无可展示的单局详情。"])
     lines.append("有效对局列表（新→旧）：" if list_only else "有效对局详情（新→旧）：")
+    if list_only:
+        lines.append("当前未请求单局详情；恢复、振刀、武器、魂玉等详情指标不可用。")
     for index, record in enumerate(records, 1):
         hero = _hero_label(record.get("hero_id"), hero_names)
         ts = record.get("time")
-        time_str = datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M") if ts else "—"
+        ts = _timestamp_ms(ts)
+        time_str = datetime.fromtimestamp(ts / 1000, BEIJING).strftime("%m-%d %H:%M") if ts else "—"
+        delta = record.get("rating_delta")
+        delta_str = f"{delta:+.0f}" if delta is not None else "—"
         lines.append(
             f"第{index}局｜英雄：{hero}｜时间：{time_str}\n"
+            f"地图：{record.get('map') or '—'}｜评价：{record.get('grade') or '—'}\n"
+            f"排名：{_integer(record.get('rank'))}｜参赛人数：{_integer(record.get('total_users'))}\n"
+            f"积分：{_integer(record.get('rating'))}｜积分变化：{delta_str}\n"
             f"击杀：{_integer(record.get('kills'))}｜伤害：{_integer(record.get('damage'))}\n"
             f"恢复：{_integer(record.get('recovery'))}｜振刀：{_integer(record.get('parry'))}｜"
             f"存活：{_whole(record.get('survival_min'), '分')}"
         )
+        if not list_only:
+            lines.extend((
+                f"使用钩索：{_integer(record.get('grapple_used'))}｜钩索命中：{_integer(record.get('grapple_hit'))}",
+                f"招式命中：{_integer(record.get('move_hits'))}｜释放技能：{_integer(record.get('skills'))}",
+                f"救援：{_integer(record.get('rescues'))}｜复活数：{_integer(record.get('revives'))}",
+                f"移动距离：{_whole(record.get('distance_km'), 'km')}｜消耗货币：{_integer(record.get('currency'))}",
+                f"武器（伤害占比）：{'、'.join(record.get('weapons') or []) or '—'}",
+                f"魂玉：{'、'.join(record.get('souls') or []) or '—'}",
+                f"标签：{'、'.join(record.get('tags') or []) or '—'}",
+            ))
         lines.append("")
     return "\n".join(lines).strip()
 

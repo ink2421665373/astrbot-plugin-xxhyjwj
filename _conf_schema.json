@@ -94,11 +94,11 @@
   "hero_mappings": {
     "type": "template_list",
     "description": "英雄编号与名称对照",
-    "hint": "点击添加条目，填写编号和名称；已有条目可展开修改。支持两位编号（如 30）或完整英雄编号。保存后下一次查询生效，优先于接口返回的名称。",
+    "hint": "推荐进入插件详情 → 可视化视图 → 英雄与赛季管理页编辑。也可在此添加、修改两位编号或完整英雄ID。保存后下一次查询生效，配置名称优先于接口。",
     "templates": {
       "hero": {
         "name": "英雄编号对照",
-        "display_item": "hero_id",
+        "display_item": "hero_name",
         "hide_hint_in_list": true,
         "items": {
           "hero_id": {
@@ -269,6 +269,38 @@
       }
     ]
   },
+  "season_mappings": {
+    "type": "template_list",
+    "description": "赛季编码与名称对照",
+    "hint": "推荐进入可视化视图的赛季页，输入昵称后点击从接口同步全部赛季；普通战绩查询也会自动收录接口目录。可修改名称、补充真实编码并选择唯一查询赛季，保存后优先于接口自动识别；历史赛季显示为指定赛季，pre-01显示为全部赛季。",
+    "templates": {
+      "season": {
+        "name": "赛季对照",
+        "display_item": "season_name",
+        "hide_hint_in_list": true,
+        "items": {
+          "season_id": {
+            "description": "赛季编码",
+            "type": "string",
+            "hint": "填写接口实际使用的编码，不是赛季序号猜测值。",
+            "default": ""
+          },
+          "season_name": {
+            "description": "赛季名称",
+            "type": "string",
+            "default": ""
+          },
+          "is_current": {
+            "description": "战绩查询使用此赛季",
+            "type": "bool",
+            "hint": "只允许一项开启，勾选后需保存。战绩、详细查询及AI优先使用此编码；列表或主模式概览请求失败时，本次回退到全部赛季一次，不修改选择。限流或登录失效时停止请求。全部关闭并保存则恢复接口自动识别。",
+            "default": false
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "query_interval_seconds": {
     "type": "float",
     "description": "A 用户请求间隔（秒）",
@@ -278,8 +310,14 @@
   "request_interval_seconds": {
     "type": "float",
     "description": "B 机器人请求每项间隔（秒）",
-    "hint": "机器人**每一次**上游请求之间的最小间隔，覆盖搜索/绑定/轮询/更新/对局列表/详情/解绑全部请求。B 包含 C：详情请求取 max(B, C)。设 0 = 关闭（默认）。",
-    "default": 0.0
+    "hint": "机器人每一次上游请求之间的最小间隔，覆盖搜索/绑定/轮询/更新/对局列表/详情/解绑。B 包含 C：详情请求取 max(B, C)。新配置默认1.5秒；已有0值会保留，遇到限流建议先调至2秒。设0仅关闭固定间隔，限流保护仍生效。",
+    "default": 1.5
+  },
+  "rate_limit_cooldown_seconds": {
+    "type": "float",
+    "description": "上游限流后暂停请求（秒）",
+    "hint": "检测到小黑盒限流后，立即停止后续请求，本地暂停期间再次查询会直接提示等待，不自动重试。默认60秒，范围10至3600秒；若HTTP429响应的Retry-After更长则遵守更长时间。这是本地保护，并不保证上游在等待结束后恢复。",
+    "default": 60.0
   },
   "detail_interval_seconds": {
     "type": "float",
@@ -334,6 +372,16 @@
     "hint": "回执方式为 reaction 时使用，默认 277；仅 aiocqhttp 生效。表情回应调用失败会自动退回文字回执。",
     "default": "277"
   },
+  "result_display_format": {
+    "type": "string",
+    "description": "战绩结果显示形式",
+    "hint": "文字=发送原文字结果；图片=发送一张完整长图，保留全部数据。图片生成失败时自动分条回退文字。保存后下一次查询生效。",
+    "options": [
+      "文字",
+      "图片"
+    ],
+    "default": "文字"
+  },
   "result_reply_method": {
     "type": "string",
     "description": "战绩结果回复方式",
@@ -355,5 +403,83 @@
       "全部开启"
     ],
     "default": "全部开启"
+  },
+  "enable_query_progress": {
+    "type": "bool",
+    "description": "显示查询等待提示",
+    "hint": "默认使用安静模式：短查询不提示，等待超过阈值最多提示一次。关闭后不发送进度；收到请求立刻回执是独立设置。",
+    "default": true
+  },
+  "query_progress_interval_seconds": {
+    "type": "float",
+    "description": "详细进度提示间隔（秒）",
+    "hint": "仅详细进度模式生效，默认8秒，范围3至120秒；所有阶段提示统一限频。安静模式不按此间隔追加消息。",
+    "default": 8.0
+  },
+  "send_original_image_file": {
+    "type": "bool",
+    "description": "图片结果附带原图文件",
+    "hint": "默认关闭。图片发送后，额外发送相同PNG文件，适配器须支持文件消息。文件在插件数据目录保留，超过24小时的本插件原图在下一次发送原图时清理；跨容器部署需配置AstrBot文件回调或共享路径。失败会提示，保留已发送图片。",
+    "default": false
+  },
+  "query_progress_mode": {
+    "type": "string",
+    "description": "查询进度模式",
+    "options": [
+      "等待时提示一次",
+      "详细进度"
+    ],
+    "default": "等待时提示一次",
+    "hint": "推荐等待时提示一次。详细进度会追加阶段/场次消息，所有提示均受间隔限制，阶段切换也不例外。"
+  },
+  "query_progress_wait_seconds": {
+    "type": "float",
+    "description": "查询等待提示阈值（秒）",
+    "default": 15.0,
+    "hint": "安静模式专用，默认等待15秒后最多提示一次，范围5至120秒。完成、失败或取消后停止等待提示。"
+  },
+  "enable_ai_analysis": {
+    "type": "bool",
+    "description": "启用AI战绩分析",
+    "default": true,
+    "hint": "启用战绩分析指令。使用AstrBot已配置的聊天模型，不额外填写密钥。模型调用可能消耗对应服务额度。"
+  },
+  "ai_auto_analysis": {
+    "type": "bool",
+    "description": "普通查询后自动分析",
+    "default": false,
+    "hint": "默认关闭。开启后战绩查询、详细查询、战绩绑定会在原结果后追加AI评价；战绩分析指令始终按需调用，不额外重复查询战绩接口。"
+  },
+  "ai_provider_id": {
+    "type": "string",
+    "description": "AI分析聊天模型",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "从AstrBot已有聊天模型选择。留空跟随当前会话模型；选择后仅用于本插件，不改变聊天模型。"
+  },
+  "ai_persona_id": {
+    "type": "string",
+    "description": "AI分析人格",
+    "default": "",
+    "_special": "select_persona",
+    "hint": "从AstrBot已有的人格选择。留空跟随当前会话有效人格；选择后仅用于分析。使用人格系统提示词，不携带聊天历史或执行人格工具。"
+  },
+  "ai_timeout_seconds": {
+    "type": "int",
+    "description": "AI分析超时（秒）",
+    "default": 60,
+    "hint": "范围10至180秒，失败或超时保留原战绩，不展示模型接口错误原文。"
+  },
+  "ai_max_matches": {
+    "type": "int",
+    "description": "AI分析最多携带几场明细",
+    "default": 10,
+    "hint": "范围1至50场。近期汇总仍依据全部有效对局，模型明细输入受长度预算限制并明确标注覆盖数，不影响原战绩展示。"
+  },
+  "ai_input_max_chars": {
+    "type": "int",
+    "description": "AI战绩证据输入字符预算",
+    "default": 12000,
+    "hint": "范围3000至30000字符，不含所选人格提示词。超预算优先减少AI明细和部分概览指标，保留近期汇总；不影响原战绩展示。可按模型上下文大小调整。"
   }
 }
