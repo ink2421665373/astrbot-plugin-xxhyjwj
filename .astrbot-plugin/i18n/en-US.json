@@ -7,6 +7,10 @@
     "diagnostics": {
       "title": "Data Diagnostics",
       "description": "Inspect sanitized season catalogs, metrics, missing fields and request times."
+    },
+    "nicknames": {
+      "title": "Nicknames & Roles",
+      "description": "Pin nicknames to a unique role ID so both commands and natural-language queries resolve directly."
     }
   },
   "pages": {
@@ -17,6 +21,10 @@
     "diagnostics": {
       "title": "Data Diagnostics",
       "description": "Inspect sanitized season catalogs, metrics, missing fields and request times."
+    },
+    "nicknames": {
+      "title": "Nicknames & Roles",
+      "description": "Pin nicknames to a unique role ID so both commands and natural-language queries resolve directly."
     }
   }
 }

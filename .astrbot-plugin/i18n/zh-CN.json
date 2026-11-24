@@ -7,6 +7,10 @@
     "diagnostics": {
       "title": "数据诊断",
       "description": "查看接口返回的赛季编码、指标、缺失情况和请求时间。"
+    },
+    "nicknames": {
+      "title": "昵称与角色",
+      "description": "把常用昵称固定到角色唯一标识（角色ID），指令和自然语言查询都会优先使用。"
     }
   },
   "pages": {
@@ -17,6 +21,10 @@
     "diagnostics": {
       "title": "数据诊断",
       "description": "查看接口返回的赛季编码、指标、缺失情况和请求时间。"
+    },
+    "nicknames": {
+      "title": "昵称与角色",
+      "description": "把常用昵称固定到角色唯一标识（角色ID），指令和自然语言查询都会优先使用。"
     }
   }
 }

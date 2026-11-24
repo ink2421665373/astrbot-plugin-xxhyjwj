@@ -5,7 +5,14 @@ import time
 
 from .diagnostics import DiagnosticStore
 
-from .mapping_config import MAPPING_KEYS, collect_season_catalog, mapping_snapshot, validate_mappings
+from .mapping_config import (
+    MAPPING_KEYS,
+    NICKNAME_KEYS,
+    collect_season_catalog,
+    mapping_snapshot,
+    validate_mappings,
+    validate_nickname_mappings,
+)
 
 
 class MappingViewMixin:
@@ -26,6 +33,9 @@ class MappingViewMixin:
         context.register_web_api("/astrbot_plugin_naraka/diagnostics", self.view_diagnostics, ["GET"], "读取脱敏接口数据诊断")
         context.register_web_api("/astrbot_plugin_naraka/diagnostics/clear", self.view_clear_diagnostics, ["POST"], "清空内存中的接口诊断记录")
         context.register_web_api("/astrbot_plugin_naraka/diagnostics/cache/clear", self.view_clear_cache, ["POST"], "清空单局详情缓存")
+        context.register_web_api("/astrbot_plugin_naraka/nicknames", self.view_get_nicknames, ["GET"], "读取昵称与角色ID对照")
+        context.register_web_api("/astrbot_plugin_naraka/nicknames/save", self.view_save_nicknames, ["POST"], "保存昵称与角色ID对照")
+        context.register_web_api("/astrbot_plugin_naraka/nicknames/resolve", self.view_resolve_nickname, ["POST"], "按昵称搜索并解析角色唯一标识")
         return True
 
     async def view_diagnostics(self):
@@ -64,6 +74,74 @@ class MappingViewMixin:
         file_state = self._reload_web_auth()
         return dict(data_mode=self.data_mode, has_credentials=bool(self.logged_in),
                     credential_file_state=file_state, online_verified=False)
+
+    async def view_get_nicknames(self):
+        return self._mapping_web.json_response(
+            dict(mapping_snapshot(self.config), login_status=self._web_login_status()))
+
+    async def view_save_nicknames(self):
+        web = self._mapping_web
+        payload = await web.request.json(default=None)
+        if not isinstance(payload, dict):
+            return web.error_response("请求内容必须是对象", status_code=400)
+        try:
+            values = {"nickname_mappings": validate_nickname_mappings(payload.get("nickname_mappings"))}
+        except ValueError as exc:
+            return web.error_response(str(exc), status_code=400)
+        async with self._mapping_view_lock:
+            if payload.get("revision") != mapping_snapshot(self.config)["revision"]:
+                return web.error_response("配置已被其他页面修改，请重新载入后再编辑", status_code=409)
+            before = copy.deepcopy(self.config.get("nickname_mappings", []))
+            try:
+                self.config.save_config(values)
+            except Exception:
+                self.config["nickname_mappings"] = before
+                return web.error_response("配置保存失败，未应用本次修改，请检查 AstrBot 日志与磁盘权限", status_code=500)
+            return web.json_response(dict(mapping_snapshot(self.config), saved=True))
+
+    async def view_resolve_nickname(self):
+        """面板里输入昵称 → 走免登录搜索拿 role_id（只读展示用，不写入配置）。"""
+        web = self._mapping_web
+        payload = await web.request.json(default=None)
+        if not isinstance(payload, dict):
+            return web.error_response("请求内容必须是对象", status_code=400)
+        nickname = payload.get("nickname")
+        if not isinstance(nickname, str) or not nickname.strip() or len(nickname) > 80:
+            return web.error_response("请填写要解析的玩家昵称", status_code=400)
+        nickname = nickname.strip()
+        cooldown = self._start_query_cooldown()
+        if cooldown:
+            return web.error_response(f"请求过于频繁，请{cooldown}秒后再试", status_code=429)
+        try:
+            async with self._session() as session:
+                rows = await self._public_search_rows(session, nickname, limit=20)
+        except Exception as exc:
+            return web.error_response(f"搜索失败：{self._error_text(exc)}", status_code=400)
+        exact = [row for row in rows if str(row.get("role_name") or "").strip() == nickname]
+        candidates = exact or rows
+        if not candidates:
+            return web.error_response(f"没有找到「{nickname}」，请核对昵称后重试。", status_code=404)
+        if len(candidates) > 1 and not exact:
+            preview = [{"role_id": str(row.get("role_id") or ""),
+                        "role_name": str(row.get("role_name") or ""),
+                        "server": str(row.get("server") or "")} for row in candidates[:10]]
+            try:
+                return web.error_response("匹配到多个玩家，请填写更精确的昵称", status_code=409, extra=preview)
+            except TypeError:
+                return web.error_response(
+                    "匹配到多个玩家，请填写更精确的昵称：" + "；".join(
+                        f"{item['role_name'] or '—'}（{item['role_id']}）" for item in preview),
+                    status_code=409)
+        row = candidates[0]
+        role_id = str(row.get("role_id") or "")
+        if not role_id:
+            return web.error_response("搜索结果缺少角色ID", status_code=400)
+        return web.json_response({
+            "nickname": nickname,
+            "role_id": role_id,
+            "role_name": str(row.get("role_name") or nickname),
+            "server": str(row.get("server") or "163"),
+        })
 
     async def view_login_status(self):
         return self._mapping_web.json_response(self._web_login_status())

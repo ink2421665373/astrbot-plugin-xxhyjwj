@@ -42,7 +42,7 @@ class RateLimitTests(unittest.TestCase):
             HeyboxError=api.HeyboxError, HeyboxRateLimited=api.HeyboxRateLimited,
             HeyboxLoginRequired=api.HeyboxLoginRequired, aiohttp=api.aiohttp,
             QueryProgress=QueryProgress, AstrMessageEvent=object, DEFAULT_SERVER="163",
-            looks_like_role_id=lambda text: False,
+            looks_like_role_id=lambda text: False, nickname_lookup=lambda config, name: None,
             _ReadResult=lambda **kwargs: SimpleNamespace(**kwargs))
         exec(compile(ast.fix_missing_locations(ast.Module(body=functions + [cls], type_ignores=[])), "main.py", "exec"), env)
         view = env["Harness"]()

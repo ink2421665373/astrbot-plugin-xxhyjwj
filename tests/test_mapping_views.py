@@ -181,7 +181,7 @@ class MappingViewTests(unittest.TestCase):
     def test_get_exposes_only_mapping_fields(self):
         status, body = asyncio.run(self.view.view_get_mappings())
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"hero_mappings", "season_mappings", "revision", "login_status"})
+        self.assertEqual(set(body), {"hero_mappings", "season_mappings", "nickname_mappings", "revision", "login_status"})
 
     def test_save_persists_and_preserves_unrelated_config(self):
         status, body = self.save(hero_mappings=[dict(hero_id="3", hero_name="新显示名")],

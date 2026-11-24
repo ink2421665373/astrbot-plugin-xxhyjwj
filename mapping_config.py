@@ -6,6 +6,9 @@ import re
 
 MAPPING_KEYS = ("hero_mappings", "season_mappings")
 
+# 昵称 → 角色唯一标识（role_id）的对照表，供指令与 LLM 工具共用
+NICKNAME_KEYS = ("nickname_mappings",)
+
 
 def validate_mappings(payload):
     if not isinstance(payload, dict):
@@ -51,9 +54,76 @@ def validate_mappings(payload):
     return result
 
 
+def _normalize_nickname(value: str) -> str:
+    """对照时的比较键：去空白、统一小写、去掉常见零宽字符。"""
+    cleaned = "".join(
+        char for char in str(value or "") if char.isprintable() and ord(char) not in (0x200B, 0x200C, 0x200D, 0xFEFF)
+    )
+    return cleaned.strip().lower()
+
+
+def nickname_key(nickname: str) -> str:
+    """对外暴露的归一化函数，供查询链路做精确匹配。"""
+    return _normalize_nickname(nickname)
+
+
+def validate_nickname_mappings(entries) -> list[dict]:
+    """校验昵称映射表：[{nickname, role_id, role_name?, server?}]。
+
+    * ``nickname`` 必填，最多 80 字
+    * ``role_id`` 必填，只允许数字（小黑盒 game_id），最多 32 位
+    * 归一化后的昵称不可重复
+    """
+    if not isinstance(entries, list) or len(entries) > 500:
+        raise ValueError("nickname_mappings 必须是列表，且最多500项")
+    normalized, seen = [], set()
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"昵称第{index}项必须是对象")
+        nickname = entry.get("nickname")
+        role_id = entry.get("role_id")
+        if not isinstance(nickname, str) or not isinstance(role_id, str):
+            raise ValueError(f"昵称第{index}项的昵称和角色ID必须是文字")
+        nickname = nickname.strip()
+        role_id = role_id.strip()
+        if not nickname or len(nickname) > 80 or any(ord(char) < 32 for char in nickname):
+            raise ValueError(f"昵称第{index}项昵称不能为空，且最多80字")
+        if not role_id or len(role_id) > 32 or not re.fullmatch(r"[0-9]{1,32}", role_id):
+            raise ValueError(f"昵称第{index}项角色ID必须是数字（小黑盒角色ID）")
+        key = _normalize_nickname(nickname)
+        if not key:
+            raise ValueError(f"昵称第{index}项昵称为空白内容")
+        if key in seen:
+            raise ValueError(f"存在重复昵称：{nickname}")
+        seen.add(key)
+        row = {"nickname": nickname, "role_id": role_id}
+        for field in ("role_name", "server"):
+            text = entry.get(field)
+            if isinstance(text, str) and text.strip() and len(text.strip()) <= 80:
+                row[field] = text.strip()
+        normalized.append(row)
+    return normalized
+
+
+def nickname_lookup(config, nickname: str) -> dict | None:
+    """按归一化昵称查已保存的 role_id；没配就返回 None。"""
+    key = _normalize_nickname(nickname)
+    if not key:
+        return None
+    for row in config.get("nickname_mappings", []) or []:
+        if not isinstance(row, dict):
+            continue
+        if _normalize_nickname(row.get("nickname") or "") == key:
+            role_id = str(row.get("role_id") or "").strip()
+            if role_id:
+                return dict(row, role_id=role_id)
+    return None
+
+
 def mapping_snapshot(config):
     # Never expose the rest of the plugin settings or authentication state.
     data = {key: copy.deepcopy(config.get(key, [])) for key in MAPPING_KEYS}
+    data.update({key: copy.deepcopy(config.get(key, [])) for key in NICKNAME_KEYS})
     revision = hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     return dict(data, revision=revision)
 

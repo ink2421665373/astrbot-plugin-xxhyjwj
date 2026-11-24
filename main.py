@@ -33,7 +33,7 @@ from .binding import BindingManager
 from .ai_analysis import AIAnalysisMixin, build_analysis_data
 from .delivery import QueryProgress, save_originals, split_message
 from .auth_state import read_saved_auth
-from .mapping_config import merge_season_options
+from .mapping_config import merge_season_options, nickname_lookup
 from .mapping_views import MappingViewMixin
 from .report_image import render_report_images
 from .heybox_api import (
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.7.9")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.8.0")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1011,6 +1011,19 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         * ``(None, "")``     —— 确实搜不到（调用方可以走绑定兜底）
         * ``(None, reason)`` —— 同名歧义等，``reason`` 直接展示给用户
         """
+        # 已登记的昵称：直接用它的角色唯一标识，跳过模糊搜索与账号绑定
+        known = nickname_lookup(self.config, name)
+        if known is not None:
+            logger.info(
+                f"[naraka] 昵称映射命中 nickname={name!r} role_id={known['role_id']}"
+            )
+            return {
+                "role_id": known["role_id"],
+                "role_name": str(known.get("role_name") or name),
+                "server": str(known.get("server") or DEFAULT_SERVER),
+                "from_mapping": True,
+            }, ""
+
         def pick(rows: list[dict]) -> tuple[dict | None, bool]:
             exact = [row for row in rows if row.get("role_name") == name]
             if len(exact) == 1:

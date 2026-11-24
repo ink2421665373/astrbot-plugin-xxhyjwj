@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>昵称与角色 · 永劫无间</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <p class="eyebrow">永劫无间 · 资料管理</p>
+      <h1>昵称与角色</h1>
+      <p class="muted">把常用昵称固定到角色唯一标识（角色ID），指令和自然语言查询都会优先用它。</p>
+    </div>
+    <span id="save-state" class="badge">正在连接</span>
+  </header>
+  <div id="notice" role="status" aria-live="polite">正在连接 AstrBot…</div>
+
+  <section class="help">
+    <strong>为什么需要这一步</strong>
+    <p>昵称可以重复或被改名，角色ID是小黑盒给每个角色的唯一标识。在这里登记后，无论你说“战绩查询 张三”还是对机器人说“查一下张三的战绩”，都会直接定位到登记的这个角色，不会再走模糊搜索或触发账号绑定。</p>
+    <p class="muted">角色ID 由系统解析后<b>只读展示</b>，不能手改；要换人就删除该行重新解析。解析走免登录通道，不需要登录。</p>
+  </section>
+
+  <section class="toolbar" aria-label="解析工具">
+    <label class="grow">玩家昵称
+      <input id="resolve-nickname" type="text" maxlength="80" placeholder="输入精确的玩家昵称" aria-label="要解析的玩家昵称">
+    </label>
+    <div class="actions">
+      <button id="resolve" disabled>解析并新增</button>
+    </div>
+  </section>
+  <div id="candidates" class="panel" hidden>
+    <h2>匹配到多个玩家</h2>
+    <p class="muted">请选择你要登记的那一个（按角色ID 精确登记，避免同名混淆）。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>昵称</th><th>角色ID</th><th>服务器</th><th class="remove-column">操作</th></tr></thead>
+        <tbody id="candidate-rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <section class="table-wrap" aria-label="昵称对照表格">
+    <table>
+      <thead><tr><th>昵称（可查询用）</th><th>角色ID（唯一标识 · 只读）</th><th>接口角色名</th><th>服务器</th><th class="remove-column">操作</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" class="empty" hidden>暂无条目。在上方输入昵称，点击“解析并新增”。</div>
+  </section>
+
+  <footer>
+    <span id="summary" class="muted">尚未载入</span>
+    <div class="actions">
+      <button id="reload" disabled>重新载入</button>
+      <button id="save" class="primary" disabled>保存全部修改</button>
+    </div>
+  </footer>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
