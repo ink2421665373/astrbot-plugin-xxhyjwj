@@ -1,4 +1,4 @@
-"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.1")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.2")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -694,6 +694,19 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             lines.append(self._public_row_line(row))
         lines.append(f"查近期对局：战绩查询 {nickname}")
         yield self._note(event, "\n".join(lines))
+
+    # ==================== 清理其它插件的误注入提示 ====================
+
+    @filter.on_llm_request(priority=-100)
+    async def strip_foreign_game_hints(self, event: AstrMessageEvent, request):
+        """清掉其它插件误注入到本次请求里的提示（见 tools._strip_foreign_hints）。
+
+        必须定义在本模块（插件主模块）内：AstrBot 只把主模块里的处理函数绑定到插件实例，
+        写到 tools.py 的 Mixin 里会因为模块路径不匹配而变成未绑定函数，调用时缺 self。
+        ``priority=-100``：handler 按 ``-priority`` 排序，数字越小越晚执行，
+        正好排在剑三插件（默认 0）之后，能读到它改完的 prompt。
+        """
+        await self._strip_foreign_hints(event, request)
 
     # ==================== 指令分发 ====================
 

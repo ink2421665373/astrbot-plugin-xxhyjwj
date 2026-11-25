@@ -552,5 +552,146 @@ class ToolBindingTests(unittest.TestCase):
         self.assertIn("self._bind_llm_tool_handlers()", body)
 
 
+class ForeignHintGuardTests(unittest.TestCase):
+    """清理其它插件（剑三）误注入提示的判定与动作。"""
+
+    NUDGE = (
+        "\n\n（内部提示：这是剑三数据查询，必须调用 mingjian_query 工具，禁止用 search_meme_wiki、"
+        "astr_kb_search、web_search 等工具确认游戏术语，也不要直接文字回答。"
+        "若一次问了两件数据，请分别调用两次 mingjian_query。）"
+    )
+    HINT = "（剑三名剑数据）查排行时调用 mingjian_query。"
+
+    def make(self, **config):
+        obj = make_mixin(**config)
+        obj._requests = []
+        return obj
+
+    @staticmethod
+    def make_event(text, extras=None):
+        store = dict(extras or {})
+
+        class Event:
+            unified_msg_origin = "default:GroupMessage:1"
+
+            def get_message_str(self):
+                return text
+
+            def set_extra(self, key, value):
+                store[key] = value
+
+            def get_extra(self, key, default=None):
+                return store.get(key, default)
+
+            def extras(self):
+                return dict(store)
+
+        return Event()
+
+    @staticmethod
+    def make_request(prompt, system=""):
+        return SimpleNamespace(prompt=prompt, system_prompt=system)
+
+    def run_guard(self, obj, event, request):
+        asyncio.run(obj._strip_foreign_hints(event, request))
+
+    def test_naraka_message_gets_foreign_hint_stripped(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.make_event("查一下永劫的lzn战绩")
+        request = self.make_request("查一下永劫的lzn战绩" + self.NUDGE, "你是助手。\n\n" + self.HINT)
+        self.run_guard(obj, event, request)
+        self.assertNotIn("剑三数据查询", request.prompt)
+        self.assertEqual(request.prompt, "查一下永劫的lzn战绩")
+        self.assertNotIn("mingjian_query", request.system_prompt)
+        self.assertIn("永劫无间", request.system_prompt)
+
+    def test_retry_marker_is_cleared(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.make_event("永劫战绩 君墨", {"astrbot_plugin_mingjian.query_retry_request": {"actions": ("战绩",)}})
+        request = self.make_request("永劫战绩 君墨" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertIsNone(event.get_extra("astrbot_plugin_mingjian.query_retry_request"))
+
+    def test_jx3_message_is_never_touched(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.make_event("查一下某服单排战绩")
+        request = self.make_request("查一下某服单排战绩" + self.NUDGE, self.HINT)
+        self.run_guard(obj, event, request)
+        self.assertIn("剑三数据查询", request.prompt)
+        self.assertIn("mingjian_query", request.system_prompt)
+
+    def test_jx3_wins_when_both_sides_mentioned(self):
+        obj = self.make(enable_llm_tools=True)
+        text = "永劫和剑三哪个好玩，顺便查下名剑战绩"
+        event = self.make_event(text)
+        request = self.make_request(text + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertIn("剑三数据查询", request.prompt)
+
+    def test_shared_words_alone_do_not_trigger(self):
+        obj = self.make(enable_llm_tools=True, nickname_mappings=[])
+        # 只有共享词（单排/战绩），没有游戏专有名词 → 不猜，保持原样
+        event = self.make_event("查一下某服单排战绩")
+        request = self.make_request("查一下某服单排战绩" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertIn("剑三数据查询", request.prompt)
+
+    def test_registered_nickname_counts_as_naraka_evidence(self):
+        obj = self.make(enable_llm_tools=True, nickname_mappings=[{"nickname": "君墨", "role_id": "slil000037188700210163"}])
+        event = self.make_event("查一下君墨单排战绩")
+        request = self.make_request("查一下君墨单排战绩" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertNotIn("剑三数据查询", request.prompt)
+
+    def test_switch_off_leaves_request_untouched(self):
+        obj = self.make(enable_llm_tools=True, llm_tool_strip_foreign_hints=False)
+        event = self.make_event("永劫战绩")
+        request = self.make_request("永劫战绩" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertIn("剑三数据查询", request.prompt)
+
+    def test_master_switch_off_leaves_request_untouched(self):
+        obj = self.make(enable_llm_tools=False)
+        event = self.make_event("永劫战绩")
+        request = self.make_request("永劫战绩" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertIn("剑三数据查询", request.prompt)
+
+    def test_clean_request_is_not_modified(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.make_event("永劫战绩")
+        request = self.make_request("永劫战绩", "你是助手。")
+        self.run_guard(obj, event, request)
+        self.assertEqual(request.prompt, "永劫战绩")
+        self.assertEqual(request.system_prompt, "你是助手。")
+
+    def test_broken_request_does_not_raise(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.make_event("永劫战绩")
+        self.run_guard(obj, event, SimpleNamespace())  # 缺 prompt/system_prompt 属性
+
+    def test_game_detection_uses_exclusive_words(self):
+        obj = self.make(enable_llm_tools=True, nickname_mappings=[])
+        self.assertEqual(obj._game_of_message("永劫 天人三排 战绩"), "naraka")
+        self.assertEqual(obj._game_of_message("振刀怎么练"), "naraka")
+        self.assertEqual(obj._game_of_message("剑三名名剑大会 33 排行".replace("名名", "名")), "jx3")
+        # 只有共享词（单排/环境/战绩）时一律判不出，宁可不清理也不误伤剑三
+        self.assertEqual(obj._game_of_message("查下本周单排环境"), "")
+        self.assertEqual(obj._game_of_message("查一下某服单排战绩"), "")
+
+    def test_hook_is_registered_in_main_module(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8-sig")
+        self.assertIn("@filter.on_llm_request(priority=-100)", source)
+        self.assertIn("await self._strip_foreign_hints(event, request)", source)
+
+    def test_config_exposes_strip_switch(self):
+        import json
+        data = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
+        entry = data.get("llm_tool_strip_foreign_hints")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.get("type"), "bool")
+        self.assertTrue(entry.get("default"))
+
+
 if __name__ == "__main__":
     unittest.main()

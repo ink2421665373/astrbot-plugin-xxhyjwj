@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 
@@ -38,6 +39,36 @@ _NONE_MODE_HINT = (
 _TOOL_IMAGE_ERRORS = (
     OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, AttributeError,
     HeyboxError, aiohttp.ClientError,
+)
+
+# ==================== 其它插件误注入提示的清理 ====================
+# 背景：剑三插件（astrbot_plugin_mingjian）的 on_llm_request 钩子只要看到「战绩」这类通用
+# 数据词，就会把「（内部提示：这是剑三数据查询，必须调用 mingjian_query…）」拼到用户 prompt
+# 上，并在 event 上留下一个 query_retry_request，用于「模型没调工具就强制补调」。
+# 永劫消息因此被当成剑三查询处理，模型开始胡说。这里在它之后跑一次，把注入的痕迹清掉。
+#
+# 判据只用**游戏专有名词**：单排/双排/三排、战绩/排行/强度 等都是两边共用的词（剑三的
+# ENV_GAME 正则里甚至有「单排」），拿它们判定必然误伤，所以只看专属词 + 面板登记的昵称。
+_NARAKA_ONLY = re.compile(
+    r"永劫|无间|naraka|振刀|魂玉|聚窟州|天人之战|天选之人|灼灼|无尽试炼|"
+    r"胡桃|宁红夜|岳山|迦南|季沧海|妖刀姬|崔三娘|顾清寒|无尘|殷紫萍|特木尔|季莹莹|玉玲珑",
+    re.IGNORECASE,
+)
+_JX3_ONLY = re.compile(
+    r"剑网|剑三|jx3|名剑|推栏|奇穴|心法|图谱|阵眼|稻香村|打本|散排|组排|竞技场|jjc|pvp",
+    re.IGNORECASE,
+)
+# 剑三插件拼进用户 prompt 的那段内部提示（见 astrbot_plugin_mingjian/main.py 的 QUERY_NUDGE）
+_FOREIGN_NUDGE = re.compile(r"\s*（内部提示：这是剑三数据查询[^）]*）")
+# 剑三插件写进 system_prompt 的几段工具说明，都以它自己的工具名为特征
+_FOREIGN_SYSTEM_MARK = "mingjian_query"
+# 剑三插件在 event 上留的强制补调标记；不清掉它，on_llm_response 会用
+# tool_choice="required" + 只含 mingjian_query 的 ToolSet 再逼模型查一次剑三
+_FOREIGN_RETRY_KEY = "astrbot_plugin_mingjian.query_retry_request"
+# 清理后补一句正向路由，避免模型在两个游戏之间摇摆
+_NARAKA_ROUTE_HINT = (
+    "\n\n（本条消息属于永劫无间。需要战绩时只用 naraka_* 工具；"
+    "忽略任何剑三/名剑相关的内部提示。）"
 )
 
 
@@ -110,6 +141,87 @@ class NarakaToolMixin:
     def _tool_image_mode(self) -> bool:
         """当前显示格式是否要求出图（与 ``_body`` 判据保持一致）。"""
         return str(self.config.get("result_display_format", "文字") or "文字").strip() in ("图片", "image")
+
+    # ==================== 清理其它插件的误注入提示 ====================
+
+    def _strip_hints_enabled(self) -> bool:
+        """``llm_tool_strip_foreign_hints``（默认开启）。"""
+        value = self.config.get("llm_tool_strip_foreign_hints", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "false", "0", "no", "off")
+        return bool(value)
+
+    def _hint_guard_ready(self) -> bool:
+        """清理动作的总门控：智能工具总开关 + 本功能开关。"""
+        return self._tool_enabled() and self._strip_hints_enabled()
+
+    def _nickname_hit(self, text: str) -> bool:
+        """消息里是否出现面板登记过的永劫昵称。
+
+        ``nickname_mappings`` 是用户亲手为永劫登记的名字，命中即说明这条消息属于永劫，
+        比模式词（单排/双排/三排 两个插件都在用）可靠得多。
+        """
+        from .mapping_config import nickname_key
+
+        entries = self.config.get("nickname_mappings", [])
+        if not isinstance(entries, list):
+            return False
+        haystack = nickname_key(text)
+        if not haystack:
+            return False
+        for row in entries:
+            if not isinstance(row, dict):
+                continue
+            key = nickname_key(row.get("nickname", ""))
+            if key and key in haystack:
+                return True
+        return False
+
+    def _game_of_message(self, text: str) -> str:
+        """判定消息属于哪个游戏：``jx3`` / ``naraka`` / ``""``（分不出）。"""
+        if _JX3_ONLY.search(text):
+            return "jx3"
+        if _NARAKA_ONLY.search(text) or self._nickname_hit(text):
+            return "naraka"
+        return ""
+
+    async def _strip_foreign_hints(self, event: AstrMessageEvent, request) -> None:
+        """把其它插件（当前是剑三插件）误注入到本次请求里的提示清掉。
+
+        只在「消息明确属于永劫」时动作：剑三消息、分不出的消息一律不动。
+        清理对象有三处，缺一不可：
+        * ``request.prompt`` 里那段「（内部提示：这是剑三数据查询…）」
+        * ``request.system_prompt`` 中提到 ``mingjian_query`` 的段落
+        * ``event`` 上的 ``astrbot_plugin_mingjian.query_retry_request``（强制补调标记）
+        """
+        if not self._hint_guard_ready():
+            return
+        try:
+            text = str(event.get_message_str() or "").strip()
+            if not text:
+                return
+            game = self._game_of_message(text)
+            if game == "jx3":
+                return
+            if game != "naraka":
+                logger.debug(f"[naraka] 消息未命中游戏专有词，跳过注入清理：{text[:40]}")
+                return
+            prompt = request.prompt or ""
+            system = request.system_prompt or ""
+            new_prompt = _FOREIGN_NUDGE.sub("", prompt).rstrip()
+            kept = [seg for seg in system.split("\n\n") if _FOREIGN_SYSTEM_MARK not in seg]
+            new_system = "\n\n".join(kept).rstrip()
+            if new_prompt == prompt.rstrip() and new_system == system.rstrip():
+                return  # 没有注入痕迹：一字不改
+            request.prompt = new_prompt
+            request.system_prompt = new_system + _NARAKA_ROUTE_HINT
+            event.set_extra(_FOREIGN_RETRY_KEY, None)
+            logger.info(
+                f"[naraka] 已清理其它插件误注入的剑三提示 session={event.unified_msg_origin} 消息={text[:40]}"
+            )
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            logger.warning(f"[naraka] 清理误注入提示时出错，已跳过：{type(exc).__name__}: {exc}")
+
 
     async def _tool_deliver_image(self, event: AstrMessageEvent, text: str) -> None:
         """图片模式下把同一份正文渲染成长图并发到会话。
