@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.8.2")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.8.3")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1552,3 +1552,35 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             for chunk in _split_lines((f"{fallback_notice}\n查询失败：{self._error_text(exc)}").strip().splitlines()):
                 yield self._note(event, chunk)
+
+
+def _bind_llm_tool_module_path() -> None:
+    """把本插件注册的 LLM 工具归属到 main 模块。
+
+    AstrBot 在插件加载完时会用 ``handler.__module__ == 插件主模块路径`` 判断
+    工具归属，只有命中的工具才会被回填 ``handler_module_path`` 并在 WebUI 里
+    显示成「插件来源（origin=plugin）」。本插件的工具方法定义在 tools.py 的
+    Mixin 里，函数模块路径是 ``...tools``，因此被判成 ``unknown``：模型照样
+    能调用（工具在注册表里且 active），但「人格设定 → 人格能力 → 工具」和
+    「函数工具」页面都不会列出它们。
+
+    这里在模块导入阶段（早于 AstrBot 回填）先补上归属，让面板能显示出来。
+    """
+
+    try:
+        from astrbot.core.provider.register import llm_tools as _llm_tools
+    except (ImportError, AttributeError):  # pragma: no cover - 旧版本 AstrBot
+        return
+    func_list = getattr(_llm_tools, "func_list", None)
+    if not isinstance(func_list, list):
+        return
+    for func_tool in func_list:
+        name = getattr(func_tool, "name", "")
+        if not isinstance(name, str) or not name.startswith("naraka_"):
+            continue
+        if getattr(func_tool, "handler_module_path", None):
+            continue
+        func_tool.handler_module_path = __name__
+
+
+_bind_llm_tool_module_path()
