@@ -450,5 +450,107 @@ class ToolImageDeliveryTests(unittest.TestCase):
         event.send.assert_not_awaited()
 
 
+class ToolBindingTests(unittest.TestCase):
+    """回归：工具方法必须绑定到插件实例，否则调用时 event 会落进 self。
+
+    AstrBot 只在「handler 的 ``__module__`` 等于插件主模块」时才自动绑定，
+    而本插件的工具方法在 ``tools.py`` 的 Mixin 里，因此必须由插件自己补绑定。
+    """
+
+    def tool_fn(self, name="tool_query_summary"):
+        return vars(sys.modules["naraka_test_package.tools"].NarakaToolMixin)[name]
+
+    def register_modules(self, entries):
+        register = ModuleType("astrbot.core.provider.register")
+        register.llm_tools = SimpleNamespace(func_list=entries)
+        provider = ModuleType("astrbot.core.provider")
+        provider.register = register
+        core = ModuleType("astrbot.core")
+        core.provider = provider
+        return {
+            "astrbot.core": core,
+            "astrbot.core.provider": provider,
+            "astrbot.core.provider.register": register,
+        }
+
+    def entry(self, name="naraka_query_summary", handler=None, module_path=None):
+        return SimpleNamespace(
+            name=name,
+            handler=self.tool_fn() if handler is None else handler,
+            handler_module_path=module_path,
+        )
+
+    def test_unbound_handler_produces_the_reported_type_error(self):
+        raw = self.tool_fn()  # 未经绑定的函数，等价于 llm_tools 里注册的那个
+        with self.assertRaises(TypeError) as ctx:
+            raw(SimpleNamespace(), player="lzn", mode="单排")
+        self.assertIn("event", str(ctx.exception))
+
+    def test_binding_makes_handler_a_bound_method(self):
+        obj = make_mixin(enable_llm_tools=True)
+        tool = self.entry()
+        with patch.dict(sys.modules, self.register_modules([tool])):
+            obj._bind_llm_tool_handlers()
+        self.assertTrue(inspect.ismethod(tool.handler))
+        self.assertIs(tool.handler.__self__, obj)
+        self.assertEqual(tool.handler_module_path, type(obj).__module__)
+
+    def test_bound_handler_accepts_event_positionally(self):
+        obj = make_mixin(enable_llm_tools=True)
+        obj._query_lock = asyncio.Lock()
+        obj._run_read = AsyncMock(return_value=SimpleNamespace(
+            ok=True, report_text="战绩正文", texts=["战绩正文"], reason="", needs_bind=False,
+            nickname="lzn", analysis_data={}))
+        tool = self.entry()
+        with patch.dict(sys.modules, self.register_modules([tool])):
+            obj._bind_llm_tool_handlers()
+        event = SimpleNamespace(get_group_id=lambda: "g", get_sender_id=lambda: "u")
+        result = tool.handler(event, player="lzn", mode="")
+        self.assertTrue(inspect.isasyncgen(result))
+
+        async def drain():
+            return [chunk async for chunk in result]
+        chunks = asyncio.run(drain())
+        self.assertTrue(chunks)
+        self.assertIn("战绩", chunks[-1])
+
+    def test_partial_handler_is_rebased_on_instance(self):
+        obj = make_mixin(enable_llm_tools=True)
+        import functools as ft
+        tool = self.entry(handler=ft.partial(self.tool_fn()))
+        with patch.dict(sys.modules, self.register_modules([tool])):
+            obj._bind_llm_tool_handlers()
+        self.assertTrue(inspect.ismethod(tool.handler))
+        self.assertIs(tool.handler.__self__, obj)
+
+    def test_other_plugins_tools_are_left_alone(self):
+        obj = make_mixin(enable_llm_tools=True)
+        foreign = self.entry(name="mingjian_query", handler=lambda event: None)
+        handler_before = foreign.handler
+        with patch.dict(sys.modules, self.register_modules([foreign])):
+            obj._bind_llm_tool_handlers()
+        self.assertIs(foreign.handler, handler_before)
+        self.assertIsNone(foreign.handler_module_path)
+
+    def test_tool_without_matching_method_is_skipped(self):
+        obj = make_mixin(enable_llm_tools=True)
+        stranger = self.entry(name="naraka_not_a_method", handler=lambda event: None)
+        handler_before = stranger.handler
+        with patch.dict(sys.modules, self.register_modules([stranger])):
+            obj._bind_llm_tool_handlers()
+        self.assertIs(stranger.handler, handler_before)
+
+    def test_missing_register_module_is_tolerated(self):
+        obj = make_mixin(enable_llm_tools=True)
+        with patch.dict(sys.modules, {"astrbot.core.provider.register": None}):
+            obj._bind_llm_tool_handlers()  # 不抛异常即可
+
+    def test_main_calls_the_binding_hook_in_init(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8-sig")
+        body = source.split("def __init__(self, context: Context, config: AstrBotConfig):")[1]
+        body = body.split("def data_mode")[0]
+        self.assertIn("self._bind_llm_tool_handlers()", body)
+
+
 if __name__ == "__main__":
     unittest.main()

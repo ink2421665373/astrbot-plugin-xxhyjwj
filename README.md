@@ -1,6 +1,6 @@
 # 永劫无间战绩查询
 
-**当前版本：1.9.0**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
+**当前版本：1.9.1**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
 
 适用于 AstrBot 4.29.0-beta.1 及以上版本与 QQ（aiocqhttp）的永劫无间**端游**战绩插件。
 按昵称查询小黑盒中的近期对局、单局详情和赛季总览。

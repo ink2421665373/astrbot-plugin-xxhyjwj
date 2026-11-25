@@ -1,5 +1,28 @@
 # 更新日志
 
+## 1.9.1
+
+### 修复
+
+- **自然语言调用工具直接报错**：`TypeError: NarakaToolMixin.tool_query_summary() missing 1
+  required positional argument: 'event'`。
+  - AstrBot 只在「处理函数的 `__module__` 等于插件主模块」时才把工具绑到插件实例上
+    （`star_manager` 加载插件时的绑定循环）。本插件的工具方法定义在 `tools.py` 的
+    `NarakaToolMixin` 里，模块路径是 `...naraka.tools`，永远不满足该条件，
+    于是 `func_tool_manager` 执行 `handler(event, **kwargs)` 时 `event` 落进了 `self`，
+    报「缺少 event 参数」。
+  - 1.8.3 只补了 `handler_module_path`（修好了 WebUI 里的来源显示），但没有修绑定，
+    工具被真正调用后才暴露。
+  - 现在插件在 `__init__` 末尾调用 `_bind_llm_tool_handlers()`，把 6 个 `naraka_*` 工具的
+    handler 换成绑定到当前实例的方法，并保留 `handler_module_path` 让 WebUI 仍归到本插件。
+
+### 测试
+
+- 新增 `ToolBindingTests`（8 条）：复现未绑定时的 `TypeError`、绑定后 handler 是绑定方法、
+  绑定后按 `handler(event, **kwargs)` 调用能正常产出异步生成器、`functools.partial` 形式可复原、
+  其它插件工具不受影响、找不到同名方法时跳过、缺少 register 模块时容错、
+  `main.py` 的 `__init__` 确实调用了绑定钩子
+
 ## 1.9.0
 
 ### 新增

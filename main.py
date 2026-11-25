@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.0")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.1")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -229,6 +229,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             unbind_interval=self._unbind_retry_interval(),
             pace=self._bind_pace,
         )
+        self._bind_llm_tool_handlers()
 
     # ==================== 配置 ====================
 

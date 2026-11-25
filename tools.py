@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 
@@ -44,6 +45,42 @@ class NarakaToolMixin:
     """被 :class:`~.main.NarakaPlugin` 继承，提供 LLM 可调用的工具方法。"""
 
     # ==================== 内部辅助 ====================
+
+    def _bind_llm_tool_handlers(self) -> None:
+        """把本插件注册的 llm_tool 处理函数绑定到当前插件实例。
+
+        AstrBot 只在「处理函数的 ``__module__`` 等于插件主模块」时才自动把工具
+        绑到插件实例上（``star_manager`` 加载插件时的绑定循环）。本插件的工具方法
+        定义在 ``tools.py`` 的 Mixin 里，模块路径是 ``...naraka.tools``，永远不满足
+        该条件，于是 ``func_tool_manager`` 调用 ``handler(event, **kwargs)`` 时
+        ``event`` 会落进 ``self``，报
+        ``tool_query_summary() missing 1 required positional argument: 'event'``。
+
+        这里在实例化后自己补一次绑定：把 handler 换成 ``getattr(self, 函数名)``
+        得到的绑定方法，并保留 ``handler_module_path`` 让 WebUI 仍把它归类到插件。
+        """
+        try:
+            from astrbot.core.provider.register import llm_tools as _llm_tools
+        except (ImportError, AttributeError):  # pragma: no cover - 旧版本 AstrBot
+            return
+        func_list = getattr(_llm_tools, "func_list", None)
+        if not isinstance(func_list, list):
+            return
+        module_path = type(self).__module__
+        for func_tool in func_list:
+            name = getattr(func_tool, "name", "")
+            if not isinstance(name, str) or not name.startswith("naraka_"):
+                continue
+            handler = getattr(func_tool, "handler", None)
+            if handler is None:
+                continue
+            raw = handler.func if isinstance(handler, functools.partial) else handler
+            method = getattr(self, getattr(raw, "__name__", ""), None)
+            if not callable(method):
+                continue
+            func_tool.handler = method
+            func_tool.handler_module_path = module_path
+            logger.debug(f"[naraka] 已绑定 llm tool 处理函数：{name} -> {module_path}")
 
     def _tool_enabled(self) -> bool:
         """总开关：``enable_llm_tools``（默认开启）。"""
