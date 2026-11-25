@@ -1,4 +1,4 @@
-"""针对 tools.py（LLM 工具层）的单元测试。
+﻿"""针对 tools.py（LLM 工具层）的单元测试。
 
 覆盖点：
 * 工具**不会**往群里发消息（不出现 event.send / _body / _note）
@@ -55,6 +55,8 @@ def make_mixin(**config):
     obj.logged_in = True
     obj._query_lock = asyncio.Lock()
     obj._ai_lock = asyncio.Lock()
+    obj._number_setting = lambda name, default, low, high: default  # 命令通道同名的取数助手
+    obj._reply = lambda event, text, method=None: None             # 回执只发一次，这里吞掉
 
     class _AsyncCM:
         """可重复使用的异步上下文管理器替身。"""
@@ -473,6 +475,15 @@ class ToolBindingTests(unittest.TestCase):
             "astrbot.core.provider.register": register,
         }
 
+    def harness(self, **config):
+        stub_dir = str(ROOT / "tests")
+        if stub_dir not in sys.path:
+            sys.path.insert(0, stub_dir)
+        if "astrbot" not in sys.modules:
+            import astrbot_stub  # noqa: F401
+        importlib.import_module("naraka_test_package.tools")
+        return make_mixin(**config)
+
     def entry(self, name="naraka_query_summary", handler=None, module_path=None):
         return SimpleNamespace(
             name=name,
@@ -487,7 +498,7 @@ class ToolBindingTests(unittest.TestCase):
         self.assertIn("event", str(ctx.exception))
 
     def test_binding_makes_handler_a_bound_method(self):
-        obj = make_mixin(enable_llm_tools=True)
+        obj = self.harness()
         tool = self.entry()
         with patch.dict(sys.modules, self.register_modules([tool])):
             obj._bind_llm_tool_handlers()
@@ -496,7 +507,7 @@ class ToolBindingTests(unittest.TestCase):
         self.assertEqual(tool.handler_module_path, type(obj).__module__)
 
     def test_bound_handler_accepts_event_positionally(self):
-        obj = make_mixin(enable_llm_tools=True)
+        obj = self.harness()
         obj._query_lock = asyncio.Lock()
         obj._run_read = AsyncMock(return_value=SimpleNamespace(
             ok=True, report_text="战绩正文", texts=["战绩正文"], reason="", needs_bind=False,
@@ -714,6 +725,119 @@ class ForeignHintGuardTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.get("type"), "bool")
         self.assertTrue(entry.get("default"))
+
+
+class ToolNoticeTests(unittest.TestCase):
+    """自然语言查询要几十秒，群里得有「正在查询」的回执，否则看起来像没收到。"""
+
+    @classmethod
+    def setUpClass(cls):
+        stub_dir = ROOT / "tests"
+        sys.path.insert(0, str(stub_dir))
+        if "astrbot" not in sys.modules:
+            import astrbot_stub  # noqa: F401
+        cls.tools = importlib.import_module("naraka_test_package.tools")
+
+    def make(self, **config):
+        obj = make_mixin(**config)
+        obj.sent: list[tuple[str, str | None]] = []
+
+        async def reply(event, text, method=None):
+            obj.sent.append((text, method))
+
+        obj._reply = reply
+        return obj
+
+    def event(self):
+        store = {}
+
+        class Event:
+            def get_message_str(self):
+                return "查一下李知恩的三排战绩"
+
+            def get_extra(self, key, default=None):
+                return store.get(key, default)
+
+            def set_extra(self, key, value):
+                store[key] = value
+
+            def get_group_id(self):
+                return "g"
+
+            def get_sender_id(self):
+                return "u"
+
+        return Event()
+
+    def run_async(self, awaitable):
+        return asyncio.new_event_loop().run_until_complete(awaitable)
+
+    def drain(self, gen):
+        async def consume():
+            return [chunk async for chunk in gen]
+
+        return self.run_async(consume())
+
+    def test_ack_is_sent_once_per_event(self):
+        obj = self.make(enable_llm_tools=True)
+        event = self.event()
+        self.run_async(obj._tool_ack(event))
+        self.run_async(obj._tool_ack(event))          # AI 评价会读两遍战绩，只回执一次
+        self.assertEqual(len(obj.sent), 1)
+        self.assertEqual(obj.sent[0][0], "正在查询战绩，请稍等…")
+        self.assertEqual(obj.sent[0][1], "quote")
+
+    def test_ack_switch_off_sends_nothing(self):
+        obj = self.make(enable_llm_tools=True, llm_tool_start_notice=False)
+        self.run_async(obj._tool_ack(self.event()))
+        self.assertEqual(obj.sent, [])
+
+    def test_ack_text_can_be_customized(self):
+        obj = self.make(enable_llm_tools=True, llm_tool_notice_text="马上就好")
+        self.run_async(obj._tool_ack(self.event()))
+        self.assertEqual(obj.sent[0][0], "马上就好")
+
+    def test_ack_empty_text_sends_nothing(self):
+        obj = self.make(enable_llm_tools=True, llm_tool_notice_text="   ")
+        self.run_async(obj._tool_ack(self.event()))
+        self.assertEqual(obj.sent, [])
+
+    def test_ack_failure_is_swallowed(self):
+        obj = self.make(enable_llm_tools=True)
+
+        async def boom(event, text, method=None):
+            raise OSError("network down")
+
+        obj._reply = boom
+        self.run_async(obj._tool_ack(self.event()))  # 不抛
+
+    def test_ack_falls_back_to_plain_for_reaction(self):
+        obj = self.make(enable_llm_tools=True, start_notice_method="reaction")
+        self.run_async(obj._tool_ack(self.event()))
+        self.assertEqual(obj.sent[0][1], "plain")
+
+    def test_summary_tool_acks_before_querying(self):
+        obj = self.make(enable_llm_tools=True)
+        obj._allowed_group = lambda event: True
+        obj._start_query_cooldown = lambda: 0
+        obj._tool_deliver_image = AsyncMock()
+        obj._run_read = AsyncMock(return_value=SimpleNamespace(
+            ok=True, report_text="战绩正文", texts=["战绩正文"], reason="", needs_bind=False,
+            nickname="lzn", analysis_data={}))
+        obj._session = MagicMock()
+        obj._binding = MagicMock(residual=AsyncMock())
+        obj._tool_residual_recover = AsyncMock()
+
+        text = self.drain(obj.tool_query_summary(self.event(), "lzn", "三排"))[-1]
+        self.assertEqual(len(obj.sent), 1)       # 先回执
+        self.assertIn("战绩正文", text)
+
+    def test_config_exposes_notice_switches(self):
+        import json
+        data = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
+        for key, kind in (("llm_tool_start_notice", "bool"), ("llm_tool_notice_text", "string")):
+            self.assertIn(key, data)
+            self.assertEqual(data[key].get("type"), kind)
 
 
 if __name__ == "__main__":

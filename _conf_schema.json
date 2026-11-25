@@ -1,4 +1,4 @@
-﻿{
+{
   "data_mode": {
     "type": "string",
     "description": "数据模式",
@@ -511,6 +511,18 @@
     "type": "bool",
     "default": true,
     "hint": "别的插件（例如剑三战绩插件）会在发问前把「这是剑三数据查询」这类内部提示塞进请求，导致模型把永劫消息当剑三处理。开启后，只有消息里出现永劫专有名词或面板登记过的昵称时，插件才会把这类注入的提示清掉；剑三消息和分不出的消息一律不动。关闭则完全不管别人的请求。"
+  },
+  "llm_tool_start_notice": {
+    "description": "自然语言查询先回一条短提示",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用自然语言让机器人查战绩时，会先回一条「正在查询…」，避免几十秒没有反应、以为机器人没收到。默认开启。"
+  },
+  "llm_tool_notice_text": {
+    "description": "自然语言查询的提示文案",
+    "type": "string",
+    "default": "正在查询战绩，请稍等…",
+    "hint": "上面那条短提示的内容。留空则不回。"
   },
   "nickname_mappings": {
     "type": "template_list",

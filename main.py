@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.3")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.4")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1449,7 +1449,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             async for message in self._season_report(event, player, mode_id, season):
                 yield message
 
-    async def _season_report(self, event: AstrMessageEvent, player: str, mode_id: str | None, season: str):
+    async def _season_report(self, event: AstrMessageEvent, player: str, mode_id: str | None, season: str, progress=None):
         queried_at = time.time()
         fallback_notice = ""
         try:

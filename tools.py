@@ -25,6 +25,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 
 from .ai_analysis import AnalysisError
+from .delivery import QueryProgress
 from .heybox_api import DEFAULT_SERVER, HeyboxError
 from .record_query import resolve_mode
 from .report_image import render_report_images
@@ -78,6 +79,8 @@ _NEUTRAL_ROUTE_HINT = (
     "\n\n（本条消息的游戏归属不明确：如果用户在问永劫无间，调用 naraka_* 工具；"
     "如果用户在问剑网三，调用 mingjian_query。不要自行假设游戏归属。）"
 )
+# 同一条消息只回执一次（AI 评价会先后读两遍战绩）
+_ACK_EXTRA_KEY = "astrbot_plugin_naraka.tool_acked"
 
 
 class NarakaToolMixin:
@@ -149,6 +152,58 @@ class NarakaToolMixin:
     def _tool_image_mode(self) -> bool:
         """当前显示格式是否要求出图（与 ``_body`` 判据保持一致）。"""
         return str(self.config.get("result_display_format", "文字") or "文字").strip() in ("图片", "image")
+
+    # ==================== 即时回执与进度提示 ====================
+    # 自然语言查询要跑上游接口，实测一次「三排战绩」约 50 秒；期间模型不会说话，
+    # 群里看起来就像机器人没反应。这里补一条即时回执 + 长查询进度提示，
+    # 语义与命令通道的 ``enable_start_notice`` / ``enable_query_progress`` 对齐。
+
+    def _tool_notice_enabled(self) -> bool:
+        """自然语言查询是否先回一条「正在查询」：``llm_tool_start_notice``（默认开启）。"""
+        value = self.config.get("llm_tool_start_notice", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "false", "0", "no", "off")
+        return bool(value)
+
+    def _already_acked(self, event) -> bool:
+        try:
+            return bool(event.get_extra(_ACK_EXTRA_KEY))
+        except AttributeError:
+            return False
+
+    def _mark_acked(self, event) -> None:
+        try:
+            event.set_extra(_ACK_EXTRA_KEY, True)
+        except AttributeError:
+            pass
+
+    async def _tool_ack(self, event) -> None:
+        """查询前回一条短提示。同一事件只回一次（AI 评价会读两遍战绩）。"""
+        if not self._tool_notice_enabled() or self._already_acked(event):
+            return
+        self._mark_acked(event)
+        text = str(self.config.get("llm_tool_notice_text", "正在查询战绩，请稍等…") or "").strip()
+        if not text:
+            return
+        method = str(self.config.get("start_notice_method", "quote") or "quote").strip().lower()
+        if method in ("reaction", "at", "mention"):
+            method = "plain"  # 回执不走表情/at
+        reply = getattr(self, "_reply", None)
+        if not callable(reply):
+            return
+        try:
+            await reply(event, text, method=method)
+        except _TOOL_IMAGE_ERRORS as exc:
+            logger.warning(f"[naraka][tool] 回执发送失败: {type(exc).__name__}")
+
+    def _tool_progress(self, event):
+        """复刻命令通道的进度提示配置，供 ``_run_read`` 使用。"""
+        enabled = self.config.get("enable_query_progress", True) is True
+        interval = self._number_setting("query_progress_interval_seconds", 8.0, 3.0, 120.0)
+        wait_seconds = self._number_setting("query_progress_wait_seconds", 15.0, 5.0, 120.0)
+        return QueryProgress(event, enabled=enabled, interval=interval,
+                             mode=self.config.get("query_progress_mode", "等待时提示一次"),
+                             wait_seconds=wait_seconds)
 
     # ==================== 清理其它插件的误注入提示 ====================
 
@@ -291,7 +346,7 @@ class NarakaToolMixin:
             logger.warning(f"[naraka][tool] 残留恢复失败: {type(exc).__name__}")
 
     async def _tool_read_with_bind(self, player: str, mode: str, detailed: bool,
-                                   force_refresh: bool = False) -> object:
+                                   force_refresh: bool = False, progress=None) -> object:
         """只读查询 + 自动绑定兜底，返回 ``_ReadResult``。
 
         逻辑与命令版 ``_query_records`` 的阶段一/阶段二等价，但**不发送任何消息**，
@@ -315,7 +370,8 @@ class NarakaToolMixin:
         async with self._query_lock:
             try:
                 report = await self._run_read(player, mode, detailed,
-                                              force_refresh=force_refresh, for_ai=False)
+                                              force_refresh=force_refresh, for_ai=False,
+                                              progress=progress)
             except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
                 return self._fail_result(self._tool_error_text(exc))
         if report.ok or not report.needs_bind:
@@ -389,7 +445,13 @@ class NarakaToolMixin:
         if self.data_mode == "none":
             yield _NONE_MODE_HINT
             return
-        result = await self._tool_read_with_bind(player, mode, detailed=False)
+        await self._tool_ack(event)
+        progress = self._tool_progress(event)
+        progress.start()
+        try:
+            result = await self._tool_read_with_bind(player, mode, detailed=False, progress=progress)
+        finally:
+            await progress.close()
         if getattr(result, "ok", False):
             full = getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or [])
             await self._tool_deliver_image(event, full)
@@ -425,7 +487,13 @@ class NarakaToolMixin:
         if self.data_mode == "none":
             yield _NONE_MODE_HINT
             return
-        result = await self._tool_read_with_bind(player, mode, detailed=True)
+        await self._tool_ack(event)
+        progress = self._tool_progress(event)
+        progress.start()
+        try:
+            result = await self._tool_read_with_bind(player, mode, detailed=True, progress=progress)
+        finally:
+            await progress.close()
         if getattr(result, "ok", False):
             full = getattr(result, "report_text", "") or "\n".join(getattr(result, "texts", []) or [])
             await self._tool_deliver_image(event, full)
@@ -518,11 +586,17 @@ class NarakaToolMixin:
         if self._query_lock.locked():
             yield "已有一份战绩正在查询，请稍后再试。"
             return
+        await self._tool_ack(event)
+        progress = self._tool_progress(event)
+        progress.start()
         chunks: list[str] = []
-        async with self._query_lock:
-            async for message in self._season_report(event, player, mode_id, season):
-                text = getattr(getattr(message, "chain", None), "get_plain_text", None)
-                chunks.append(text() if callable(text) else str(getattr(message, "text", "")))
+        try:
+            async with self._query_lock:
+                async for message in self._season_report(event, player, mode_id, season, progress=progress):
+                    text = getattr(getattr(message, "chain", None), "get_plain_text", None)
+                    chunks.append(text() if callable(text) else str(getattr(message, "text", "")))
+        finally:
+            await progress.close()
         full = "\n".join(chunk for chunk in chunks if chunk)
         await self._tool_deliver_image(event, full)
         yield self._tool_trim(full)
@@ -564,28 +638,34 @@ class NarakaToolMixin:
         if self._ai_lock.locked():
             yield "已有AI分析正在进行，请稍后再试。"
             return
+        await self._tool_ack(event)
+        progress = self._tool_progress(event)
+        progress.start()
         async with self._ai_lock:
-            result = await self._tool_read_with_bind(player, mode, detailed=False, force_refresh=False)
-            if not getattr(result, "ok", False):
-                yield getattr(result, "reason", "") or "查询失败"
-                return
-            # 重新取一次带 for_ai 的分析数据
-            async with self._query_lock:
-                try:
-                    ai_result = await self._run_read(player, mode, False, force_refresh=False, for_ai=True)
-                except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
-                    yield self._tool_error_text(exc)
-                    return
-            if not getattr(ai_result, "ok", False):
-                yield getattr(ai_result, "reason", "") or "查询失败"
-                return
-            data = getattr(ai_result, "analysis_data", {}) or {}
             try:
-                analysis = await self._evaluate_records(event, data)
-            except (AnalysisError, TimeoutError, HeyboxError,
-                    aiohttp.ClientError, ValueError) as exc:
-                yield f"AI分析未完成：{self._tool_error_text(exc)}"
-                return
+                result = await self._tool_read_with_bind(player, mode, detailed=False, force_refresh=False)
+                if not getattr(result, "ok", False):
+                    yield getattr(result, "reason", "") or "查询失败"
+                    return
+                # 重新取一次带 for_ai 的分析数据
+                async with self._query_lock:
+                    try:
+                        ai_result = await self._run_read(player, mode, False, force_refresh=False, for_ai=True)
+                    except (TimeoutError, HeyboxError, aiohttp.ClientError, ValueError) as exc:
+                        yield self._tool_error_text(exc)
+                        return
+                if not getattr(ai_result, "ok", False):
+                    yield getattr(ai_result, "reason", "") or "查询失败"
+                    return
+                data = getattr(ai_result, "analysis_data", {}) or {}
+                try:
+                    analysis = await self._evaluate_records(event, data)
+                except (AnalysisError, TimeoutError, HeyboxError,
+                        aiohttp.ClientError, ValueError) as exc:
+                    yield f"AI分析未完成：{self._tool_error_text(exc)}"
+                    return
+            finally:
+                await progress.close()
             # 和命令通道保持一致：原战绩全文 + AI战绩分析
             full = (getattr(ai_result, "report_text", "") or "") + "\n\nAI战绩分析\n" + analysis
             await self._tool_deliver_image(event, full)
