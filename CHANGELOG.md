@@ -1,5 +1,15 @@
 ﻿# 更新日志
 
+## 1.9.6
+
+### 新增
+- 查询回执支持昵称占位：`llm_tool_notice_text` 里的 `{nickname}` 会替换成这次查询的玩家昵称，默认文案改为「正在翻 {nickname} 的战绩，请稍等…」。
+- 新增 `llm_tool_notice_fallback`（默认「正在查战绩，请稍等…」）：文案里有 `{nickname}` 但这次拿不到昵称时使用，避免出现「正在翻  的战绩」这种空档。
+
+### 说明
+- `llm_tool_notice_text` 留空依然表示关闭回执；不含 `{nickname}` 的自定义文案原样使用。
+- 四个查询类工具（summary / detail / season / ai）都会把玩家昵称带进回执，search 与 unbind 不回执。
+
 ## 1.9.5
 
 ### 修复

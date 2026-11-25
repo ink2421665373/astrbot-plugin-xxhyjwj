@@ -521,8 +521,14 @@
   "llm_tool_notice_text": {
     "description": "自然语言查询的提示文案",
     "type": "string",
-    "default": "查询中，请稍等…",
-    "hint": "上面那条短提示的内容，默认「查询中，请稍等…」。留空则不回。"
+    "default": "正在翻 {nickname} 的战绩，请稍等…",
+    "hint": "上面那条短提示的内容。可用 {nickname} 占位符，会替换成这次查询的玩家昵称，例如默认的「正在翻 {nickname} 的战绩，请稍等…」。没有昵称可用时（例如昵称没解析出来）改用下面的备用文案。留空则回执整体关闭。"
+  },
+  "llm_tool_notice_fallback": {
+    "description": "解析不出昵称时的提示文案",
+    "type": "string",
+    "default": "正在查战绩，请稍等…",
+    "hint": "文案里写了 {nickname} 但这次拿不到昵称时用这一条，避免出现「正在翻  的战绩」这种空档。留空则退回把占位符直接删掉。"
   },
   "nickname_mappings": {
     "type": "template_list",

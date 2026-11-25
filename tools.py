@@ -83,6 +83,10 @@ _NEUTRAL_ROUTE_HINT = (
 _ACK_EXTRA_KEY = "astrbot_plugin_naraka.tool_acked"
 
 
+# 配置里没写 llm_tool_notice_text 时的内置回执文案（{nickname} 会被替换成玩家昵称）
+_DEFAULT_NOTICE_TEXT = "正在翻 {nickname} 的战绩，请稍等…"
+
+
 class NarakaToolMixin:
     """被 :class:`~.main.NarakaPlugin` 继承，提供 LLM 可调用的工具方法。"""
 
@@ -177,15 +181,18 @@ class NarakaToolMixin:
         except AttributeError:
             pass
 
-    async def _tool_ack(self, event) -> None:
+    async def _tool_ack(self, event, nickname: str = "") -> None:
         """查询前回一条短提示。同一事件只回一次（AI 评价会读两遍战绩）。
+
+        文案支持 ``{nickname}`` 占位符：有昵称就填进去（「正在翻 李知恩 的战绩…」），
+        没有就整体退回到 ``llm_tool_notice_fallback``，避免出现「正在翻  的战绩」。
 
         注意：主类的 ``_reply`` 只是**组装**消息结果，在命令通道里由 ``yield`` 交给框架
         发送；工具通道没有人 yield，必须自己 ``event.send``，否则这条回执哪儿都不会出现。
         """
         if not self._tool_notice_enabled() or self._already_acked(event):
             return
-        text = str(self.config.get("llm_tool_notice_text", "查询中，请稍等…") or "").strip()
+        text = self._tool_notice_text(nickname)
         if not text:
             return
         method = str(self.config.get("start_notice_method", "quote") or "quote").strip().lower()
@@ -202,6 +209,25 @@ class NarakaToolMixin:
             logger.info(f"[naraka][tool] 已回执「{text}」session={getattr(event, 'unified_msg_origin', '')}")
         except _TOOL_IMAGE_ERRORS as exc:
             logger.warning(f"[naraka][tool] 回执发送失败: {type(exc).__name__}")
+
+    def _tool_notice_text(self, nickname: str = "") -> str:
+        """把 ``llm_tool_notice_text`` 里的 ``{nickname}`` 换成真实昵称。
+
+        约定：配置里**没有**这个键时用内置默认文案；显式留空（``""``）表示关掉回执。
+        """
+        template = self.config.get("llm_tool_notice_text", None)
+        if template is None:
+            template = _DEFAULT_NOTICE_TEXT
+        template = str(template or "").strip()
+        fallback = str(self.config.get("llm_tool_notice_fallback", "") or "").strip()
+        name = str(nickname or "").strip()
+        if not template:
+            return ""
+        if "{nickname}" not in template:
+            return template
+        if not name:
+            return fallback or template.replace("{nickname}", "").strip()
+        return template.replace("{nickname}", name)
 
     def _tool_progress(self, event):
         """复刻命令通道的进度提示配置，供 ``_run_read`` 使用。"""
@@ -452,7 +478,7 @@ class NarakaToolMixin:
         if self.data_mode == "none":
             yield _NONE_MODE_HINT
             return
-        await self._tool_ack(event)
+        await self._tool_ack(event, player)
         progress = self._tool_progress(event)
         progress.start()
         try:
@@ -494,7 +520,7 @@ class NarakaToolMixin:
         if self.data_mode == "none":
             yield _NONE_MODE_HINT
             return
-        await self._tool_ack(event)
+        await self._tool_ack(event, player)
         progress = self._tool_progress(event)
         progress.start()
         try:
@@ -593,7 +619,7 @@ class NarakaToolMixin:
         if self._query_lock.locked():
             yield "已有一份战绩正在查询，请稍后再试。"
             return
-        await self._tool_ack(event)
+        await self._tool_ack(event, player)
         progress = self._tool_progress(event)
         progress.start()
         chunks: list[str] = []
@@ -645,7 +671,7 @@ class NarakaToolMixin:
         if self._ai_lock.locked():
             yield "已有AI分析正在进行，请稍后再试。"
             return
-        await self._tool_ack(event)
+        await self._tool_ack(event, player)
         progress = self._tool_progress(event)
         progress.start()
         async with self._ai_lock:

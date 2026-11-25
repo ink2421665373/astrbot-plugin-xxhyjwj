@@ -787,10 +787,10 @@ class ToolNoticeTests(unittest.TestCase):
     def test_ack_is_sent_once_per_event(self):
         obj = self.make(enable_llm_tools=True)
         event = self.event(obj.pushed)
-        self.run_async(obj._tool_ack(event))
-        self.run_async(obj._tool_ack(event))          # AI 评价会读两遍战绩，只回执一次
+        self.run_async(obj._tool_ack(event, "李知恩"))
+        self.run_async(obj._tool_ack(event, "李知恩"))   # AI 评价会读两遍战绩，只回执一次
         self.assertEqual(len(obj.sent), 1)
-        self.assertEqual(obj.sent[0][0], "查询中，请稍等…")
+        self.assertEqual(obj.sent[0][0], "正在翻 李知恩 的战绩，请稍等…")
         # 关键回归：结果必须真的被 event.send 出去，否则群里什么都看不到
         self.assertEqual(len(obj.pushed), 1)
         self.assertEqual(obj.sent[0][1], "quote")
@@ -809,6 +809,17 @@ class ToolNoticeTests(unittest.TestCase):
         obj = self.make(enable_llm_tools=True, llm_tool_notice_text="   ")
         self.run_async(obj._tool_ack(self.event(obj.pushed)))
         self.assertEqual(obj.sent, [])
+
+    def test_ack_uses_fallback_when_nickname_missing(self):
+        obj = self.make(enable_llm_tools=True,
+                        llm_tool_notice_fallback="正在查战绩，请稍等…")
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))
+        self.assertEqual(obj.sent[0][0], "正在查战绩，请稍等…")
+
+    def test_ack_without_placeholder_is_used_as_is(self):
+        obj = self.make(enable_llm_tools=True, llm_tool_notice_text="稍等，马上好")
+        self.run_async(obj._tool_ack(self.event(obj.pushed), "李知恩"))
+        self.assertEqual(obj.sent[0][0], "稍等，马上好")
 
     def test_ack_failure_is_swallowed(self):
         obj = self.make(enable_llm_tools=True)
