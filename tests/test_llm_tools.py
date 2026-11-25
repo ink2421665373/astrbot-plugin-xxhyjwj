@@ -614,11 +614,27 @@ class ForeignHintGuardTests(unittest.TestCase):
 
     def test_jx3_message_is_never_touched(self):
         obj = self.make(enable_llm_tools=True)
-        event = self.make_event("查一下某服单排战绩")
-        request = self.make_request("查一下某服单排战绩" + self.NUDGE, self.HINT)
+        event = self.make_event("查一下梦江南的33战绩")
+        request = self.make_request("查一下梦江南的33战绩" + self.NUDGE, self.HINT)
         self.run_guard(obj, event, request)
         self.assertIn("剑三数据查询", request.prompt)
         self.assertIn("mingjian_query", request.system_prompt)
+
+    def test_three_queue_counts_as_naraka(self):
+        # 剑三说 33/3v3，只有永劫说「三排/双排」→ 这是永劫信号
+        obj = self.make(enable_llm_tools=True, nickname_mappings=[])
+        event = self.make_event("查一下李知恩的三排战绩")
+        request = self.make_request("查一下李知恩的三排战绩" + self.NUDGE)
+        self.run_guard(obj, event, request)
+        self.assertEqual(request.prompt, "查一下李知恩的三排战绩")
+        self.assertNotIn("剑三数据查询", request.prompt)
+        self.assertIn("永劫无间", request.system_prompt)
+
+    def test_jx3_arena_numbers_are_jx3_signal(self):
+        obj = self.make(enable_llm_tools=True, nickname_mappings=[])
+        self.assertEqual(obj._game_of_message("查下这周 33 的排行"), "jx3")
+        self.assertEqual(obj._game_of_message("查下这周3v3排行"), "jx3")
+        self.assertEqual(obj._game_of_message("查下一场双排战绩"), "naraka")
 
     def test_jx3_wins_when_both_sides_mentioned(self):
         obj = self.make(enable_llm_tools=True)
@@ -628,13 +644,20 @@ class ForeignHintGuardTests(unittest.TestCase):
         self.run_guard(obj, event, request)
         self.assertIn("剑三数据查询", request.prompt)
 
-    def test_shared_words_alone_do_not_trigger(self):
+    def test_shared_words_are_neutralized(self):
         obj = self.make(enable_llm_tools=True, nickname_mappings=[])
-        # 只有共享词（单排/战绩），没有游戏专有名词 → 不猜，保持原样
-        event = self.make_event("查一下某服单排战绩")
-        request = self.make_request("查一下某服单排战绩" + self.NUDGE)
+        # 只有共享词（单排/战绩）：不删剑三的提示，但改写成中性说法，并清掉强制补调
+        event = self.make_event(
+            "查一下某服单排战绩",
+            {"astrbot_plugin_mingjian.query_retry_request": {"actions": ("战绩",)}},
+        )
+        request = self.make_request("查一下某服单排战绩" + self.NUDGE, self.HINT)
         self.run_guard(obj, event, request)
-        self.assertIn("剑三数据查询", request.prompt)
+        self.assertNotIn("剑三数据查询", request.prompt)
+        self.assertIn("游戏归属不明确", request.prompt)
+        self.assertIn("mingjian_query", request.prompt)      # 剑三仍然可用
+        self.assertNotIn("（剑三名剑数据）", request.system_prompt)   # 原来那段工具说明被拿掉
+        self.assertIsNone(event.get_extra("astrbot_plugin_mingjian.query_retry_request"))
 
     def test_registered_nickname_counts_as_naraka_evidence(self):
         obj = self.make(enable_llm_tools=True, nickname_mappings=[{"nickname": "君墨", "role_id": "slil000037188700210163"}])
