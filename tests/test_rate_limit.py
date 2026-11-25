@@ -31,7 +31,8 @@ class RateLimitTests(unittest.TestCase):
             self.clock[0] += seconds
         tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NarakaPlugin")
-        names = {"_number_setting", "_interval_b", "_interval_c", "_paced", "_start_query_cooldown",
+        names = {"_number_setting", "_interval_b", "_interval_c", "_detail_concurrency", "_paced",
+                 "_start_query_cooldown",
                  "_error_text", "_resolve_player", "_refresh", "_query_records"}
         cls = ast.ClassDef(name="Harness", bases=[], keywords=[], decorator_list=[],
                            body=[node for node in cls.body if getattr(node, "name", "") in names])

@@ -1,4 +1,4 @@
-﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.7")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.8")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -377,15 +377,28 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         """C：仅单局查询之间互相的额外最小间隔（0 = 关闭）。"""
         return self._number_setting("detail_interval_seconds", 4.0, 0.0, 120.0)
 
+    def _detail_concurrency(self) -> int:
+        """单局详情/赛季概览的同时请求上限（1 = 完全串行，保持旧行为）。"""
+        try:
+            value = int(self.config.get("detail_concurrency", 3))
+        except (AttributeError, TypeError, ValueError):
+            value = 3
+        return max(1, min(value, 8))
+
     @asynccontextmanager
     async def _paced(self, *, detail: bool = False):
         """统一请求节流。
 
         * **B** ``request_interval_seconds``：机器人**每一次**请求之间的最小间隔
         * **C** ``detail_interval_seconds``：**仅单局详情之间**的额外最小间隔
+        * **并发** ``detail_concurrency``：单局详情/赛季概览同时请求数（1 = 串行）；
+          大于 1 时 C 按并发折算（C / 并发），但不低于 B
 
         两者互不叠加，取较大值（B 包含 C）；任一为 0 即该项关闭。
         所有上游请求都必须经过这里，包括绑定/解绑/轮询/更新。
+
+        节流按「请求**开始**时刻」预约：锁内只算下一个可用时刻并占位，等待在
+        锁外进行，所以多个请求可以重叠执行——否则 9 场详情会串行排到 40 秒以上。
         """
         async with self._request_lock:
             now = time.monotonic()
@@ -398,25 +411,28 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 wait = max(wait, interval_b - (now - self._last_request_at))
             if detail:
                 interval_c = self._interval_c()
+                parallel = self._detail_concurrency()
+                if parallel > 1:
+                    interval_c = interval_c / parallel
                 if interval_c > 0 and self._last_detail_request_at is not None:
                     wait = max(wait, interval_c - (now - self._last_detail_request_at))
-            if wait > 0:
-                await asyncio.sleep(wait)
-            try:
-                yield
-            except HeyboxRateLimited as exc:
-                delay = max(self._number_setting("rate_limit_cooldown_seconds", 60.0, 10.0, 3600.0),
-                            exc.retry_after or 0)
-                self._rate_limited_until = max(getattr(self, "_rate_limited_until", 0.0), time.monotonic() + delay)
-                exc.retry_after = delay
-                logger.warning("[naraka] upstream rate limit: path=%s; local_pause=%ss",
-                               exc.path or "unknown", max(1, int(delay + 0.999)))
-                raise
-            finally:
-                stamp = time.monotonic()
-                self._last_request_at = stamp
-                if detail:
-                    self._last_detail_request_at = stamp
+            wait = max(wait, 0.0)
+            start = now + wait
+            self._last_request_at = start
+            if detail:
+                self._last_detail_request_at = start
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            yield
+        except HeyboxRateLimited as exc:
+            delay = max(self._number_setting("rate_limit_cooldown_seconds", 60.0, 10.0, 3600.0),
+                        exc.retry_after or 0)
+            self._rate_limited_until = max(getattr(self, "_rate_limited_until", 0.0), time.monotonic() + delay)
+            exc.retry_after = delay
+            logger.warning("[naraka] upstream rate limit: path=%s; local_pause=%ss",
+                           exc.path or "unknown", max(1, int(delay + 0.999)))
+            raise
 
     def _bind_pace(self):
         """绑定/解绑相关请求按 **B** 节流（C 只管单局详情之间）。"""
@@ -1201,6 +1217,17 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             detail_enabled = detail_mode == "全部开启" or (
                 detail_mode == "仅详细查询" and detailed
             )
+
+            def _parallel_slots() -> int:
+                """同时抓详情的路数；老测试替身没有这个方法时退回串行。"""
+                getter = getattr(self, "_detail_concurrency", None)
+                if getter is None:
+                    return 1
+                try:
+                    return max(1, int(getter()))
+                except (TypeError, ValueError):
+                    return 1
+
             records = []
             failures = 0
             stopped = scope_stopped
@@ -1211,32 +1238,49 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 for row in matches:
                     records.append(make_record(row, {}))
             else:
-                for detail_index, row in enumerate(matches, 1):
-                    if stopped:
-                        break
-                    match_id = str(row["match_id"])
-                    cache_key = (role_id, match_id)
-                    if force_refresh:
-                        self._detail_cache.pop(cache_key, None)
-                    detail = self._detail_cache.get(cache_key)
-                    if detail is None:
-                        try:
-                            detail = await self._fetch_detail(session, common, row)
+                # 并发抓详情：节流按请求开始时刻预约，这里只限制同时在飞的数量。
+                # 结果按 matches 原顺序回填，避免战报顺序被打乱。
+                ordered: list[dict | None] = [None] * len(matches)
+                gate = asyncio.Semaphore(_parallel_slots())
+                counter_lock = asyncio.Lock()
+                finished = 0
+
+                async def load_detail(index: int, row: dict) -> None:
+                    nonlocal failures, stopped, finished
+                    async with gate:
+                        if stopped:
+                            return
+                        match_id = str(row["match_id"])
+                        cache_key = (role_id, match_id)
+                        if force_refresh:
+                            self._detail_cache.pop(cache_key, None)
+                        detail = self._detail_cache.get(cache_key)
+                        if detail is None:
+                            try:
+                                detail = await self._fetch_detail(session, common, row)
+                            except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                                async with counter_lock:
+                                    failures += 1
+                                    finished += 1
+                                    counts = (finished, failures, sum(1 for item in ordered if item is not None))
+                                    if _must_stop_after_error(exc):
+                                        stopped = True
+                                logger.warning(f"[naraka] detail failed: {type(exc).__name__}")
+                                if progress:
+                                    await progress(f"已处理对局详情：{counts[0]}/{len(matches)}（成功{counts[2]}场，失败{counts[1]}场）")
+                                return
                             if len(self._detail_cache) >= 1000:
                                 self._detail_cache.pop(next(iter(self._detail_cache)))
                             self._detail_cache[cache_key] = detail
-                        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                            failures += 1
-                            if _must_stop_after_error(exc):
-                                stopped = True
-                                break
-                            logger.warning(f"[naraka] detail failed: {type(exc).__name__}")
-                            if progress:
-                                await progress(f"已处理对局详情：{detail_index}/{len(matches)}（失败{failures}场）")
-                            continue
-                    records.append(make_record(row, detail))
+                        ordered[index] = make_record(row, detail)
+                    async with counter_lock:
+                        finished += 1
+                        counts = (finished, failures, sum(1 for item in ordered if item is not None))
                     if progress:
-                        await progress(f"已处理对局详情：{detail_index}/{len(matches)}（成功{len(records)}场，失败{failures}场）")
+                        await progress(f"已处理对局详情：{counts[0]}/{len(matches)}（成功{counts[2]}场，失败{counts[1]}场）")
+
+                await asyncio.gather(*(load_detail(index, row) for index, row in enumerate(matches)))
+                records = [item for item in ordered if item is not None]
 
             hero_names: dict[str, str] = dict(KNOWN_HERO_NAMES)
             scores: dict[str, str] = {}
@@ -1275,29 +1319,35 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                     if _must_stop_after_error(exc):
                         stopped = True
                 if not detailed and not stopped and season_name and home is not None:
-                    # Fetch the selected mode first and reuse it for both the
-                    # season overview and the six-mode score summary.
-                    for ranked_id in dict.fromkeys((mode_id, "5000000", "12", "5000001", "4", "13", "5")):
-                        try:
-                            season_body = home if season_key == list_season and ranked_id == mode_id else await self._home_data(session, common, ranked_id, season_key)
+                    # 六个排位模式的概览互不依赖，并发取；所选模式直接用已有的 home 复用。
+                    modes = list(dict.fromkeys((mode_id, "5000000", "12", "5000001", "4", "13", "5")))
+                    mode_gate = asyncio.Semaphore(_parallel_slots())
+
+                    async def load_mode(ranked_id: str) -> None:
+                        nonlocal season_error, current_season, stopped
+                        async with mode_gate:
+                            try:
+                                season_body = home if season_key == list_season and ranked_id == mode_id else await self._home_data(session, common, ranked_id, season_key)
+                            except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                                logger.warning(f"[naraka] season mode failed: {type(exc).__name__}")
+                                if ranked_id == mode_id:
+                                    season_error = "当前模式赛季数据获取失败，请稍后重试"
+                                if _must_stop_after_error(exc):
+                                    stopped = True
+                                return
                             returned_mode = str(season_body.get("battle_tid") or ranked_id)
                             if returned_mode != ranked_id:
                                 if ranked_id == mode_id:
                                     season_error = "接口返回模式与所选模式不一致，未展示赛季数据"
-                                continue
+                                return
                             if ranked_id == mode_id:
                                 current_season = season_body
                                 season_error = ""
                             rating = str((season_body.get("player_info") or {}).get("rating") or "")
                             if rating.isdigit() and int(rating) > 0:
                                 scores[ranked_id] = rating
-                        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                            logger.warning(f"[naraka] season mode failed: {type(exc).__name__}")
-                            if ranked_id == mode_id:
-                                season_error = "当前模式赛季数据获取失败，请稍后重试"
-                            if _must_stop_after_error(exc):
-                                stopped = True
-                                break
+
+                    await asyncio.gather(*(load_mode(ranked_id) for ranked_id in modes))
 
         hero_names = apply_hero_mappings(hero_names, records, self.config.get("hero_mappings", []))
         total = len(rows)
