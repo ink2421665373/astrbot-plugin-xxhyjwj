@@ -1,6 +1,6 @@
 ﻿# 永劫无间战绩查询
 
-**当前版本：1.9.6**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
+**当前版本：1.9.7**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
 
 适用于 AstrBot 4.29.0-beta.1 及以上版本与 QQ（aiocqhttp）的永劫无间**端游**战绩插件。
 按昵称查询小黑盒中的近期对局、单局详情和赛季总览。
@@ -133,7 +133,9 @@ repo: "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj"
 
 如果同一个机器人还装了剑三战绩插件，它会在发问前做一次「提示注入」：只要消息里出现「战绩」「排行」这类通用词，就往用户 prompt 末尾拼一句「（内部提示：这是剑三数据查询，必须调用 mingjian_query 工具…）」，还会在会话上留一个强制补调标记。结果是模型把「查某某的永劫战绩」当成剑三来答，甚至开始自言自语。
 
-本插件默认开启 `llm_tool_strip_foreign_hints`，用一个排在它之后的 `on_llm_request` 钩子（`priority=-100`）做三件事：删掉那段注入文本、删掉 system prompt 里提到 `mingjian_query` 的段落、清掉那个强制补调标记，再补一句「本条属永劫无间，只用 naraka_* 工具」。
+本插件默认开启 `llm_tool_strip_foreign_hints`，用一个排在它之后的 `on_llm_request` 钩子（`priority=-100`）做四件事：删掉那段注入文本、删掉 system prompt 里提到 `mingjian_query` 的段落、清掉那个强制补调标记、再补一句「本条属永劫无间，只用 naraka_* 工具」。
+
+还有一件事必须一起做：剑三插件在它认为「这是数据查询」时，会把**整份工具清单**换成只剩它自己的 `mingjian_query`（源码 `request.func_tool = ToolSet([tool])`）。工具被换掉后模型根本看不见 `naraka_*`，用户说「查一下某某的永劫战绩」就只能得到一段闲聊。所以本插件默认还开着 `llm_tool_restore_tools`：永劫消息（以及分不出游戏的消息）会把 6 个战绩工具补回这次请求里，别人的工具一律不删。
 
 判定只看**游戏专有名词**，不看共享词：
 
@@ -359,6 +361,7 @@ AstrBot 左侧边栏默认是**扁平模式**，每个插件只占一个入口�
 | `llm_tool_max_text_chars` | `4000` | 单个工具回传给大模型的最大字符数（下限 500），超出截断 |
 | `llm_tool_send_image` | `true` | 自然语言调用时是否也把战绩长图发到会话（仅在显示格式为「图片」时生效） |
 | `llm_tool_strip_foreign_hints` | `true` | 清理其它插件误注入到请求里的提示（如剑三插件拼进用户 prompt 的「这是剑三数据查询」），只对明确属于永劫的消息生效 |
+| `llm_tool_restore_tools` | `true` | 别的插件把 `func_tool` 整个换成只剩自己那一个时，把本插件的 6 个工具补回本次请求（别人的工具不删），否则模型看不见 `naraka_*` |
 | `llm_tool_start_notice` | `true` | 自然语言查询开始前先回一条短提示，避免几十秒没反应 |
 | `llm_tool_notice_text` | `正在翻 {nickname} 的战绩，请稍等…` | 回执文案，支持 `{nickname}` 占位符；留空则关闭回执 |
 | `llm_tool_notice_fallback` | `正在查战绩，请稍等…` | 文案里有 `{nickname}` 但拿不到昵称时改用这一条 |

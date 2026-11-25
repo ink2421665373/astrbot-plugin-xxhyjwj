@@ -251,6 +251,52 @@ class NarakaToolMixin:
         """清理动作的总门控：智能工具总开关 + 本功能开关。"""
         return self._tool_enabled() and self._strip_hints_enabled()
 
+    def _restore_tools_enabled(self) -> bool:
+        """``llm_tool_restore_tools``（默认开启）。"""
+        value = self.config.get("llm_tool_restore_tools", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "false", "0", "no", "off")
+        return bool(value)
+
+    def _naraka_tool_objects(self) -> list:
+        """取本插件注册到全局表里的工具对象（handler 已是绑定方法）。"""
+        try:
+            from astrbot.core.provider.register import llm_tools
+        except (ImportError, AttributeError):  # pragma: no cover - 旧版 AstrBot
+            return []
+        func_list = getattr(llm_tools, "func_list", None)
+        if not isinstance(func_list, list):
+            return []
+        return [
+            tool
+            for tool in func_list
+            if isinstance(getattr(tool, "name", ""), str)
+            and tool.name.startswith("naraka_")
+            and getattr(tool, "active", True)
+        ]
+
+    def _restore_naraka_tools(self, request) -> int:
+        """把本插件的工具补回 ``request.func_tool``。
+
+        某些插件（例如剑三战绩插件）会把整个 ``func_tool`` 替换成只剩自己那一个工具，
+        于是模型根本看不到 ``naraka_*``，无论说什么都只能聊天或误答。这里只做「补回」，
+        不删除别人的工具；返回实际补进去的数量。
+        """
+        if not self._restore_tools_enabled():
+            return 0
+        func_tool = getattr(request, "func_tool", None)
+        if func_tool is None or not hasattr(func_tool, "add_tool"):
+            return 0
+        added = 0
+        for tool in self._naraka_tool_objects():
+            try:
+                if func_tool.get_tool(tool.name) is None:
+                    func_tool.add_tool(tool)
+                    added += 1
+            except (AttributeError, KeyError, TypeError):
+                return added
+        return added
+
     def _nickname_hit(self, text: str) -> bool:
         """消息里是否出现面板登记过的永劫昵称。
 
@@ -299,6 +345,13 @@ class NarakaToolMixin:
             game = self._game_of_message(text)
             if game == "jx3":
                 return
+            # 先补回自己的工具：别的插件可能把 func_tool 整个换掉，只留它自己那一个，
+            # 那样模型看不见 naraka_*，说什么都只能聊天。
+            restored = self._restore_naraka_tools(request)
+            if restored:
+                logger.info(
+                    f"[naraka] 已把 {restored} 个战绩工具补回本次请求 session={event.unified_msg_origin}"
+                )
             prompt = request.prompt or ""
             system = request.system_prompt or ""
             if game == "naraka":
@@ -306,7 +359,7 @@ class NarakaToolMixin:
                 kept = [seg for seg in system.split("\n\n") if _FOREIGN_SYSTEM_MARK not in seg]
                 new_system = "\n\n".join(kept).rstrip()
                 if new_prompt == prompt.rstrip() and new_system == system.rstrip():
-                    return  # 没有注入痕迹：一字不改
+                    return  # 没有注入痕迹：一字不改（工具已经补过）
                 request.prompt = new_prompt
                 request.system_prompt = new_system + _NARAKA_ROUTE_HINT
                 event.set_extra(_FOREIGN_RETRY_KEY, None)

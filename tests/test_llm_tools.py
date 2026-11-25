@@ -1,4 +1,4 @@
-﻿"""针对 tools.py（LLM 工具层）的单元测试。
+"""针对 tools.py（LLM 工具层）的单元测试。
 
 覆盖点：
 * 工具**不会**往群里发消息（不出现 event.send / _body / _note）
@@ -724,6 +724,150 @@ class ForeignHintGuardTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.get("type"), "bool")
         self.assertTrue(entry.get("default"))
+
+
+class _FakeToolSet:
+    """模拟 ``astrbot.core.agent.tool.ToolSet`` 的最小接口。"""
+
+    def __init__(self, tools=()):
+        self.tools = list(tools)
+
+    def get_tool(self, name):
+        for tool in self.tools:
+            if getattr(tool, "name", None) == name:
+                return tool
+        return None
+
+    def add_tool(self, tool):
+        if self.get_tool(tool.name) is None:
+            self.tools.append(tool)
+
+    def names(self):
+        return [tool.name for tool in self.tools]
+
+
+class ToolRestoreTests(unittest.TestCase):
+    """回归：别的插件把 ``func_tool`` 整个换掉时，必须把本插件工具补回来。
+
+    剑三插件在 ``main.py:1137-1138`` 直接 ``request.func_tool = ToolSet([tool])``，
+    只留它自己的 ``mingjian_query``；不补回来的话模型看不见 ``naraka_*``，
+    用户说「查一下XX的战绩」只能得到闲聊。
+    """
+
+    def registry(self, entries):
+        register = ModuleType("astrbot.core.provider.register")
+        register.llm_tools = SimpleNamespace(func_list=list(entries))
+        provider = ModuleType("astrbot.core.provider")
+        provider.register = register
+        core = ModuleType("astrbot.core")
+        core.provider = provider
+        return patch.dict(
+            sys.modules,
+            {
+                "astrbot.core": core,
+                "astrbot.core.provider": provider,
+                "astrbot.core.provider.register": register,
+            },
+        )
+
+    @staticmethod
+    def tool(name, active=True):
+        return SimpleNamespace(name=name, active=active)
+
+    def make(self, **config):
+        config.setdefault("enable_llm_tools", True)
+        return make_mixin(**config)
+
+    @staticmethod
+    def event(text):
+        store = {}
+
+        class Event:
+            unified_msg_origin = "default:GroupMessage:1"
+
+            def get_message_str(self):
+                return text
+
+            def set_extra(self, key, value):
+                store[key] = value
+
+            def get_extra(self, key, default=None):
+                return store.get(key, default)
+
+        return Event()
+
+    @staticmethod
+    def run_guard(obj, event, request):
+        asyncio.run(obj._strip_foreign_hints(event, request))
+
+    def test_restores_tools_replaced_by_foreign_plugin(self):
+        obj = self.make()
+        entries = [
+            self.tool("mingjian_query"),
+            self.tool("naraka_query_summary"),
+            self.tool("naraka_query_detail"),
+        ]
+        toolset = _FakeToolSet([entries[0]])
+        request = SimpleNamespace(prompt="查一下lzn的永劫战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("查一下lzn的永劫战绩"), request)
+        self.assertIn("naraka_query_summary", toolset.names())
+        self.assertIn("naraka_query_detail", toolset.names())
+        self.assertIn("mingjian_query", toolset.names())  # 不删别人的工具
+
+    def test_restore_is_idempotent(self):
+        obj = self.make()
+        entries = [self.tool("naraka_query_summary")]
+        toolset = _FakeToolSet(list(entries))
+        request = SimpleNamespace(prompt="永劫战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("永劫战绩"), request)
+            self.run_guard(obj, self.event("永劫战绩"), request)
+        self.assertEqual(toolset.names(), ["naraka_query_summary"])
+
+    def test_restore_can_be_disabled(self):
+        obj = self.make(llm_tool_restore_tools=False)
+        entries = [self.tool("mingjian_query"), self.tool("naraka_query_summary")]
+        toolset = _FakeToolSet([entries[0]])
+        request = SimpleNamespace(prompt="查一下lzn的永劫战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("查一下lzn的永劫战绩"), request)
+        self.assertEqual(toolset.names(), ["mingjian_query"])
+
+    def test_jx3_message_keeps_foreign_toolset(self):
+        obj = self.make()
+        entries = [self.tool("mingjian_query"), self.tool("naraka_query_summary")]
+        toolset = _FakeToolSet([entries[0]])
+        request = SimpleNamespace(prompt="查一下梦江南的33战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("查一下梦江南的33战绩"), request)
+        self.assertEqual(toolset.names(), ["mingjian_query"])
+
+    def test_inactive_tools_are_not_restored(self):
+        obj = self.make()
+        entries = [self.tool("naraka_query_summary", active=False)]
+        toolset = _FakeToolSet()
+        request = SimpleNamespace(prompt="永劫战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("永劫战绩"), request)
+        self.assertEqual(toolset.names(), [])
+
+    def test_request_without_toolset_is_safe(self):
+        obj = self.make()
+        request = SimpleNamespace(prompt="永劫战绩", system_prompt="")
+        with self.registry([self.tool("naraka_query_summary")]):
+            self.run_guard(obj, self.event("永劫战绩"), request)
+        self.assertEqual(request.prompt, "永劫战绩")
+
+    def test_restore_runs_even_without_injected_prompt(self):
+        """别人的注入文本可能被前面的钩子清掉，工具集仍然需要补回。"""
+        obj = self.make()
+        entries = [self.tool("mingjian_query"), self.tool("naraka_query_summary")]
+        toolset = _FakeToolSet([entries[0]])
+        request = SimpleNamespace(prompt="查一下lzn的永劫战绩", system_prompt="", func_tool=toolset)
+        with self.registry(entries):
+            self.run_guard(obj, self.event("查一下lzn的永劫战绩"), request)
+        self.assertIn("naraka_query_summary", toolset.names())
 
 
 class ToolNoticeTests(unittest.TestCase):
