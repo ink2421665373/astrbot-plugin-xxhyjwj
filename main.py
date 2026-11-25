@@ -1,4 +1,4 @@
-﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -33,7 +33,7 @@ from .binding import BindingManager
 from .ai_analysis import AIAnalysisMixin, build_analysis_data
 from .delivery import QueryProgress, save_originals, split_message
 from .auth_state import read_saved_auth
-from .mapping_config import merge_season_options, nickname_lookup
+from .mapping_config import ensure_template_keys, merge_season_options, nickname_lookup
 from .mapping_views import MappingViewMixin
 from .report_image import render_report_images
 from .heybox_api import (
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.4")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.5")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -202,6 +202,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         elif old_detail_setting == "仅战绩查询":
             config["enable_detail_query"] = "仅详细查询"
             config.save_config()
+        self._repair_nickname_template_keys()
         data_dir = Path(StarTools.get_data_dir(PLUGIN))
         data_dir.mkdir(parents=True, exist_ok=True)
         self._original_image_dir = data_dir / "original_images"
@@ -232,6 +233,28 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         self._bind_llm_tool_handlers()
 
     # ==================== 配置 ====================
+
+    def _repair_nickname_template_keys(self) -> None:
+        """给早期版本写下的裸昵称行补 ``__template_key``。
+
+        1.9.0 ~ 1.9.4 的面板保存的是 ``{nickname, role_id, ...}``，缺模板标识，
+        导致插件配置页报「缺少模板选择 nickname_mappings[N]」而打不开。这里在启动时
+        一次性补齐并落盘，之后面板与配置页都正常。
+        """
+        try:
+            current = self.config.get("nickname_mappings", [])
+            fixed = ensure_template_keys(current)
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning(f"[naraka] 昵称映射模板标识修复跳过: {type(exc).__name__}")
+            return
+        if not isinstance(current, list) or fixed == current:
+            return
+        self.config["nickname_mappings"] = fixed
+        try:
+            self.config.save_config({"nickname_mappings": fixed})
+            logger.info(f"[naraka] 已为 {len(fixed)} 条昵称映射补上 __template_key")
+        except (AttributeError, TypeError, ValueError, OSError) as exc:
+            logger.warning(f"[naraka] 昵称映射模板标识落盘失败: {type(exc).__name__}")
 
     @property
     def data_mode(self) -> str:

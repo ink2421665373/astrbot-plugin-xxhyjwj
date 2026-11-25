@@ -1,4 +1,4 @@
-"""昵称 ↔ 角色唯一标识（role_id）的校验、面板接口与查询命中测试。"""
+﻿"""昵称 ↔ 角色唯一标识（role_id）的校验、面板接口与查询命中测试。"""
 import asyncio
 import copy
 import importlib
@@ -38,7 +38,8 @@ class FakeConfig(dict):
             self.path.write_text(json.dumps(self), encoding="utf-8")
 
 
-VALID = [dict(nickname="张三", role_id="123456", role_name="张三", server="163")]
+VALID = [dict(__template_key="nickname", nickname="张三", role_id="123456",
+              role_name="张三", server="163")]
 
 
 class NicknameValidationTests(unittest.TestCase):
@@ -375,7 +376,7 @@ class MultiNicknameTests(unittest.TestCase):
             dict(role_id="2", nicknames=[]),
             dict(role_id="3"),
         ])
-        self.assertEqual(flat, [dict(nickname="甲", role_id="1")])
+        self.assertEqual(flat, [dict(__template_key="nickname", nickname="甲", role_id="1")])
 
     def test_validate_allows_several_nicknames_for_one_role(self):
         rows = validate_nickname_mappings(self.ROWS)

@@ -1,6 +1,6 @@
-# 永劫无间战绩查询
+﻿# 永劫无间战绩查询
 
-**当前版本：1.9.4**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
+**当前版本：1.9.5**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
 
 适用于 AstrBot 4.29.0-beta.1 及以上版本与 QQ（aiocqhttp）的永劫无间**端游**战绩插件。
 按昵称查询小黑盒中的近期对局、单局详情和赛季总览。
@@ -125,7 +125,7 @@ repo: "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj"
 - 战绩类工具（概览/明细/赛季/AI 评价）在「战绩显示格式」为**图片**时，会**先把同一份长图直接发到会话**，再把文本作为工具结果交给模型——所以自然语言和指令一样能看图。想只回文字，把 `llm_tool_send_image` 关掉，或把显示格式设为文字。
 - 工具复用和指令**完全相同**的保护逻辑：群白名单、查询冷却、`_query_lock` / `_ai_lock` 并发互斥、自动绑定兜底。
 - 回传文本长度受 `llm_tool_max_text_chars` 限制（默认 4000 字），超出会截断并提示改用指令看完整结果，避免把模型上下文打爆。
-- 一次自然语言查询实测要跑几十秒上游接口，这期间模型不会说话。所以工具在开始查之前会先回一条 `llm_tool_notice_text`（默认「正在查询战绩，请稍等…」，随 `llm_tool_start_notice` 开关），等超过 `query_progress_wait_seconds`（默认 15 秒）还没好，再补一句「查询仍在进行，请稍候；完成后会发送结果。」。同一条消息只回执一次。
+- 一次自然语言查询实测要跑几十秒上游接口，这期间模型不会说话。所以工具在开始查之前会先回一条 `llm_tool_notice_text`（默认「查询中，请稍等…」，随 `llm_tool_start_notice` 开关），等超过 `query_progress_wait_seconds`（默认 15 秒）还没好，再补一句「查询仍在进行，请稍候；完成后会发送结果。」。同一条消息只回执一次。
 - `naraka_unbind` 是**写操作**且有副作用，需要额外把 `llm_tool_allow_unbind` 设为 `true` 才会暴露给模型（默认 `false`）。
 - 关掉 `enable_llm_tools` 不影响任何原有指令，二者互不干扰。
 
@@ -360,4 +360,4 @@ AstrBot 左侧边栏默认是**扁平模式**，每个插件只占一个入口�
 | `llm_tool_send_image` | `true` | 自然语言调用时是否也把战绩长图发到会话（仅在显示格式为「图片」时生效） |
 | `llm_tool_strip_foreign_hints` | `true` | 清理其它插件误注入到请求里的提示（如剑三插件拼进用户 prompt 的「这是剑三数据查询」），只对明确属于永劫的消息生效 |
 | `llm_tool_start_notice` | `true` | 自然语言查询开始前先回一条短提示，避免几十秒没反应 |
-| `llm_tool_notice_text` | `正在查询战绩，请稍等…` | 上面那条短提示的文案，留空则不回 |
+| `llm_tool_notice_text` | `查询中，请稍等…` | 上面那条短提示的文案，留空则不回 |

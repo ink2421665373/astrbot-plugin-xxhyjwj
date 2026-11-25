@@ -139,17 +139,16 @@ class LlmToolTests(unittest.TestCase):
     # ---------- 发消息边界 ----------
 
     def test_tools_only_send_through_image_channel(self):
-        """除 ``_tool_deliver_image`` 之外，工具绝不调用 event.send / _body / _note 等。
+        """发消息能力只允许出现在两个白名单方法里：长图投递与查询前回执。
 
         用 AST 检查真实调用点，而不是扫源文本——docstring 里的说明会误伤子串匹配。
-        唯一的发消息入口收敛在 ``_tool_deliver_image``（图片模式下的长图投递）。
         """
         tree = ast.parse(Path(ROOT / "tools.py").read_text(encoding="utf-8"))
         banned_calls = {"send", "plain_result", "chain_result", "image_result"}
         banned_self = {"_body", "_note", "_send_at", "_ack"}
         allowed = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_tool_deliver_image":
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in ("_tool_deliver_image", "_tool_ack"):
                 allowed.update(id(sub) for sub in ast.walk(node))
         offenders = []
         for node in ast.walk(tree):
@@ -161,10 +160,10 @@ class LlmToolTests(unittest.TestCase):
                     offenders.append(f"self.{fn.attr}")
                 if fn.value.id == "event" and fn.attr in banned_calls:
                     offenders.append(f"event.{fn.attr}")
-        self.assertEqual(offenders, [], f"工具只允许经 _tool_deliver_image 发消息，发现：{offenders}")
+        self.assertEqual(offenders, [], f"工具只允许经白名单方法发消息，发现：{offenders}")
 
     def test_only_image_channel_helper_sends(self):
-        """确认发消息能力确实只存在于 _tool_deliver_image 内。"""
+        """确认发消息能力只存在于 _tool_deliver_image 与 _tool_ack 内。"""
         tree = ast.parse(Path(ROOT / "tools.py").read_text(encoding="utf-8"))
         owners = []
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]:
@@ -172,7 +171,7 @@ class LlmToolTests(unittest.TestCase):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                         and node.func.attr in ("send", "chain_result")):
                     owners.append(fn.name)
-        self.assertEqual(sorted(set(owners)), ["_tool_deliver_image"])
+        self.assertEqual(sorted(set(owners)), ["_tool_ack", "_tool_deliver_image"])
 
     # ---------- 开关 ----------
 
@@ -741,15 +740,19 @@ class ToolNoticeTests(unittest.TestCase):
     def make(self, **config):
         obj = make_mixin(**config)
         obj.sent: list[tuple[str, str | None]] = []
+        obj.pushed: list[object] = []
 
         async def reply(event, text, method=None):
+            # 主类的 _reply 只组装消息结果，工具通道必须自己 event.send
             obj.sent.append((text, method))
+            return ("result", text, method)
 
         obj._reply = reply
         return obj
 
-    def event(self):
+    def event(self, pushed=None):
         store = {}
+        bucket = pushed if pushed is not None else []
 
         class Event:
             def get_message_str(self):
@@ -767,6 +770,9 @@ class ToolNoticeTests(unittest.TestCase):
             def get_sender_id(self):
                 return "u"
 
+            async def send(self, result):
+                bucket.append(result)
+
         return Event()
 
     def run_async(self, awaitable):
@@ -780,26 +786,28 @@ class ToolNoticeTests(unittest.TestCase):
 
     def test_ack_is_sent_once_per_event(self):
         obj = self.make(enable_llm_tools=True)
-        event = self.event()
+        event = self.event(obj.pushed)
         self.run_async(obj._tool_ack(event))
         self.run_async(obj._tool_ack(event))          # AI 评价会读两遍战绩，只回执一次
         self.assertEqual(len(obj.sent), 1)
-        self.assertEqual(obj.sent[0][0], "正在查询战绩，请稍等…")
+        self.assertEqual(obj.sent[0][0], "查询中，请稍等…")
+        # 关键回归：结果必须真的被 event.send 出去，否则群里什么都看不到
+        self.assertEqual(len(obj.pushed), 1)
         self.assertEqual(obj.sent[0][1], "quote")
 
     def test_ack_switch_off_sends_nothing(self):
         obj = self.make(enable_llm_tools=True, llm_tool_start_notice=False)
-        self.run_async(obj._tool_ack(self.event()))
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))
         self.assertEqual(obj.sent, [])
 
     def test_ack_text_can_be_customized(self):
         obj = self.make(enable_llm_tools=True, llm_tool_notice_text="马上就好")
-        self.run_async(obj._tool_ack(self.event()))
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))
         self.assertEqual(obj.sent[0][0], "马上就好")
 
     def test_ack_empty_text_sends_nothing(self):
         obj = self.make(enable_llm_tools=True, llm_tool_notice_text="   ")
-        self.run_async(obj._tool_ack(self.event()))
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))
         self.assertEqual(obj.sent, [])
 
     def test_ack_failure_is_swallowed(self):
@@ -809,11 +817,11 @@ class ToolNoticeTests(unittest.TestCase):
             raise OSError("network down")
 
         obj._reply = boom
-        self.run_async(obj._tool_ack(self.event()))  # 不抛
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))  # 不抛
 
     def test_ack_falls_back_to_plain_for_reaction(self):
         obj = self.make(enable_llm_tools=True, start_notice_method="reaction")
-        self.run_async(obj._tool_ack(self.event()))
+        self.run_async(obj._tool_ack(self.event(obj.pushed)))
         self.assertEqual(obj.sent[0][1], "plain")
 
     def test_summary_tool_acks_before_querying(self):
@@ -828,7 +836,7 @@ class ToolNoticeTests(unittest.TestCase):
         obj._binding = MagicMock(residual=AsyncMock())
         obj._tool_residual_recover = AsyncMock()
 
-        text = self.drain(obj.tool_query_summary(self.event(), "lzn", "三排"))[-1]
+        text = self.drain(obj.tool_query_summary(self.event(obj.pushed), "lzn", "三排"))[-1]
         self.assertEqual(len(obj.sent), 1)       # 先回执
         self.assertIn("战绩正文", text)
 

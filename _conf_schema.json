@@ -1,4 +1,4 @@
-{
+﻿{
   "data_mode": {
     "type": "string",
     "description": "数据模式",
@@ -521,8 +521,8 @@
   "llm_tool_notice_text": {
     "description": "自然语言查询的提示文案",
     "type": "string",
-    "default": "正在查询战绩，请稍等…",
-    "hint": "上面那条短提示的内容。留空则不回。"
+    "default": "查询中，请稍等…",
+    "hint": "上面那条短提示的内容，默认「查询中，请稍等…」。留空则不回。"
   },
   "nickname_mappings": {
     "type": "template_list",

@@ -178,11 +178,14 @@ class NarakaToolMixin:
             pass
 
     async def _tool_ack(self, event) -> None:
-        """查询前回一条短提示。同一事件只回一次（AI 评价会读两遍战绩）。"""
+        """查询前回一条短提示。同一事件只回一次（AI 评价会读两遍战绩）。
+
+        注意：主类的 ``_reply`` 只是**组装**消息结果，在命令通道里由 ``yield`` 交给框架
+        发送；工具通道没有人 yield，必须自己 ``event.send``，否则这条回执哪儿都不会出现。
+        """
         if not self._tool_notice_enabled() or self._already_acked(event):
             return
-        self._mark_acked(event)
-        text = str(self.config.get("llm_tool_notice_text", "正在查询战绩，请稍等…") or "").strip()
+        text = str(self.config.get("llm_tool_notice_text", "查询中，请稍等…") or "").strip()
         if not text:
             return
         method = str(self.config.get("start_notice_method", "quote") or "quote").strip().lower()
@@ -192,7 +195,11 @@ class NarakaToolMixin:
         if not callable(reply):
             return
         try:
-            await reply(event, text, method=method)
+            result = await reply(event, text, method=method)
+            if result is not None:
+                await event.send(result)
+            self._mark_acked(event)
+            logger.info(f"[naraka][tool] 已回执「{text}」session={getattr(event, 'unified_msg_origin', '')}")
         except _TOOL_IMAGE_ERRORS as exc:
             logger.warning(f"[naraka][tool] 回执发送失败: {type(exc).__name__}")
 

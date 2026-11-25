@@ -9,6 +9,9 @@ MAPPING_KEYS = ("hero_mappings", "season_mappings")
 # 昵称 → 角色唯一标识（role_id）的对照表，供指令与 LLM 工具共用
 NICKNAME_KEYS = ("nickname_mappings",)
 
+# template_list 要求每行带模板标识，否则配置页报「缺少模板选择 nickname_mappings[N]」
+NICKNAME_TEMPLATE_KEY = "nickname"
+
 # 小黑盒端游角色主键是**字母数字混合**的 22 位串（4 位随机前缀 + 18 位数字），
 # 例如 2i67000021275100070163、i03c000022562500120163、km1r000078541000270163。
 # 它绝不等于纯数字，所以这里只做「可见字母数字」的形状校验，避免把真实 ID 挡在门外。
@@ -104,13 +107,34 @@ def validate_nickname_mappings(entries) -> list[dict]:
         if key in seen:
             raise ValueError(f"存在重复昵称：{nickname}")
         seen.add(key)
-        row = {"nickname": nickname, "role_id": role_id}
+        row = {"__template_key": NICKNAME_TEMPLATE_KEY, "nickname": nickname, "role_id": role_id}
         for field in ("role_name", "server"):
             text = entry.get(field)
             if isinstance(text, str) and text.strip() and len(text.strip()) <= 80:
                 row[field] = text.strip()
         normalized.append(row)
     return normalized
+
+
+def ensure_template_keys(entries) -> list[dict]:
+    """给缺少 ``__template_key`` 的昵称行补上模板标识。
+
+    ``template_list`` 的每一行都必须带 ``__template_key``（模板名），否则配置页会报
+    「缺少模板选择 nickname_mappings[N]: 需要 __template_key」并拒绝加载。
+    早期版本的昵称行是裸写 ``{nickname, role_id}`` 的，这里统一补齐。
+    """
+    rows = []
+    for row in entries if isinstance(entries, list) else []:
+        if not isinstance(row, dict):
+            continue
+        key = row.get("__template_key")
+        if key == NICKNAME_TEMPLATE_KEY:
+            rows.append(dict(row))
+            continue
+        fixed = {"__template_key": NICKNAME_TEMPLATE_KEY}
+        fixed.update({k: v for k, v in row.items() if k != "__template_key"})
+        rows.append(fixed)
+    return rows
 
 
 def group_nickname_rows(entries) -> list[dict]:
@@ -154,7 +178,7 @@ def flatten_nickname_groups(groups) -> list[dict]:
         role_name = group.get("role_name")
         server = group.get("server")
         for nickname in group.get("nicknames") or []:
-            row = {"nickname": nickname, "role_id": role_id}
+            row = {"__template_key": NICKNAME_TEMPLATE_KEY, "nickname": nickname, "role_id": role_id}
             if role_name:
                 row["role_name"] = role_name
             if server:
