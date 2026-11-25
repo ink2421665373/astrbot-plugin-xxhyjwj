@@ -4,11 +4,11 @@ import copy
 import time
 
 from .diagnostics import DiagnosticStore
-
 from .mapping_config import (
     MAPPING_KEYS,
-    NICKNAME_KEYS,
     collect_season_catalog,
+    flatten_nickname_groups,
+    group_nickname_rows,
     mapping_snapshot,
     validate_mappings,
     validate_nickname_mappings,
@@ -76,16 +76,35 @@ class MappingViewMixin:
                     credential_file_state=file_state, online_verified=False)
 
     async def view_get_nicknames(self):
+        snapshot = dict(mapping_snapshot(self.config))
         return self._mapping_web.json_response(
-            dict(mapping_snapshot(self.config), login_status=self._web_login_status()))
+            dict(snapshot, roles=group_nickname_rows(snapshot.get("nickname_mappings")),
+                 login_status=self._web_login_status()))
 
     async def view_save_nicknames(self):
         web = self._mapping_web
         payload = await web.request.json(default=None)
         if not isinstance(payload, dict):
             return web.error_response("请求内容必须是对象", status_code=400)
+        if "roles" in payload:
+            # 面板按「一个角色多个昵称」提交；配置里仍保存成一行一个昵称。
+            roles = payload.get("roles")
+            if not isinstance(roles, list):
+                return web.error_response("roles 必须是列表", status_code=400)
+            for item in roles:
+                if not isinstance(item, dict):
+                    return web.error_response("roles 的每一项必须是对象", status_code=400)
+                kept = [nick for nick in (item.get("nicknames") or []) if str(nick).strip()]
+                if not kept:
+                    return web.error_response(
+                        f"角色 {str(item.get('role_id') or '（未知）')} 至少要保留一个昵称；"
+                        "要移除整个角色，请直接删除该行",
+                        status_code=400)
+            entries = flatten_nickname_groups(roles)
+        else:
+            entries = payload.get("nickname_mappings")
         try:
-            values = {"nickname_mappings": validate_nickname_mappings(payload.get("nickname_mappings"))}
+            values = {"nickname_mappings": validate_nickname_mappings(entries)}
         except ValueError as exc:
             return web.error_response(str(exc), status_code=400)
         async with self._mapping_view_lock:
@@ -97,7 +116,10 @@ class MappingViewMixin:
             except Exception:
                 self.config["nickname_mappings"] = before
                 return web.error_response("配置保存失败，未应用本次修改，请检查 AstrBot 日志与磁盘权限", status_code=500)
-            return web.json_response(dict(mapping_snapshot(self.config), saved=True))
+            snapshot = dict(mapping_snapshot(self.config))
+            return web.json_response(
+                dict(snapshot, roles=group_nickname_rows(snapshot.get("nickname_mappings")),
+                     saved=True))
 
     async def view_resolve_nickname(self):
         """面板里输入昵称 → 走免登录搜索拿 role_id（只读展示用，不写入配置）。"""

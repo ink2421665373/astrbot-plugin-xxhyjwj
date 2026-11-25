@@ -14,7 +14,14 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from mapping_config import mapping_snapshot, nickname_key, nickname_lookup, validate_nickname_mappings
+from mapping_config import (
+    flatten_nickname_groups,
+    group_nickname_rows,
+    mapping_snapshot,
+    nickname_key,
+    nickname_lookup,
+    validate_nickname_mappings,
+)
 
 package = ModuleType("naraka_test_package")
 package.__path__ = [str(ROOT)]
@@ -151,7 +158,8 @@ class NicknameViewTests(unittest.TestCase):
     def test_get_exposes_nicknames_and_login_status(self):
         status, body = self.call(self.view.view_get_nicknames())
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"hero_mappings", "season_mappings", "nickname_mappings", "revision", "login_status"})
+        self.assertEqual(set(body), {"hero_mappings", "season_mappings", "nickname_mappings",
+                                     "roles", "revision", "login_status"})
 
     def test_save_persists_and_keeps_unrelated_config(self):
         self.config["unrelated"] = "keep"
@@ -312,6 +320,154 @@ class NicknameResolveQueryTests(unittest.TestCase):
         routes = {args[0]: args[2] for args in calls}
         self.assertEqual(routes["/astrbot_plugin_naraka/nicknames"], ["GET"])
         self.assertEqual(routes["/astrbot_plugin_naraka/nicknames/resolve"], ["POST"])
+
+
+class MultiNicknameTests(unittest.TestCase):
+    """一个角色可以挂多个昵称：配置仍然扁平，面板按角色聚合。"""
+
+    ROWS = [
+        dict(nickname="张三", role_id="123456", role_name="张三", server="163"),
+        dict(nickname="老三", role_id="123456"),
+        dict(nickname="  ZHANG  ", role_id="123456"),
+        dict(nickname="李四", role_id="654321", role_name="李四", server="163"),
+    ]
+
+    def test_group_merges_rows_with_same_role_id(self):
+        groups = group_nickname_rows(self.ROWS)
+        self.assertEqual([group["role_id"] for group in groups], ["123456", "654321"])
+        self.assertEqual(groups[0]["nicknames"], ["张三", "老三", "ZHANG"])
+        self.assertEqual(groups[1]["nicknames"], ["李四"])
+
+    def test_group_keeps_first_non_empty_meta_and_dedupes_case_insensitively(self):
+        groups = group_nickname_rows([
+            dict(nickname="a", role_id="1"),
+            dict(nickname="A", role_id="1"),
+            dict(nickname="b", role_id="1", role_name="角色名", server="163"),
+        ])
+        self.assertEqual(groups[0]["nicknames"], ["a", "b"])
+        self.assertEqual(groups[0]["role_name"], "角色名")
+        self.assertEqual(groups[0]["server"], "163")
+
+    def test_group_skips_blank_or_broken_rows(self):
+        groups = group_nickname_rows([
+            dict(nickname="", role_id="1"),
+            dict(nickname="有名字", role_id="  "),
+            "not-a-dict",
+            dict(nickname="正常", role_id="1"),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["nicknames"], ["正常"])
+
+    def test_group_tolerates_non_list(self):
+        self.assertEqual(group_nickname_rows(None), [])
+        self.assertEqual(group_nickname_rows({"nickname": "x"}), [])
+
+    def test_flatten_roundtrip(self):
+        groups = group_nickname_rows(self.ROWS)
+        flat = flatten_nickname_groups(groups)
+        self.assertEqual(len(flat), 4)
+        self.assertEqual({row["nickname"] for row in flat}, {"张三", "老三", "ZHANG", "李四"})
+        self.assertEqual(flatten_nickname_groups(group_nickname_rows(flat)), flat)
+
+    def test_flatten_drops_roles_without_nicknames(self):
+        flat = flatten_nickname_groups([
+            dict(role_id="1", nicknames=["甲"]),
+            dict(role_id="2", nicknames=[]),
+            dict(role_id="3"),
+        ])
+        self.assertEqual(flat, [dict(nickname="甲", role_id="1")])
+
+    def test_validate_allows_several_nicknames_for_one_role(self):
+        rows = validate_nickname_mappings(self.ROWS)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row["role_id"] for row in rows}, {"123456", "654321"})
+
+    def test_validate_rejects_same_nickname_under_two_roles(self):
+        with self.assertRaises(ValueError):
+            validate_nickname_mappings([
+                dict(nickname="张三", role_id="123456"),
+                dict(nickname=" 张三 ", role_id="654321"),
+            ])
+
+    def test_every_alias_resolves_to_the_same_role(self):
+        config = {"nickname_mappings": validate_nickname_mappings(self.ROWS)}
+        for alias in ("张三", "老三", "  zhang  ", "Zhang"):
+            hit = nickname_lookup(config, alias)
+            self.assertIsNotNone(hit, alias)
+            self.assertEqual(hit["role_id"], "123456")
+
+
+class MultiNicknameViewTests(unittest.TestCase):
+    """面板按 roles 提交，后端摊平保存。"""
+
+    setUp = NicknameViewTests.setUp
+    tearDown = NicknameViewTests.tearDown
+    call = NicknameViewTests.call
+
+    def roles_payload(self, *roles, **extra):
+        self.payload = dict(revision=mapping_snapshot(self.config)["revision"], roles=list(roles), **extra)
+        return self.call(self.view.view_save_nicknames())
+
+    def test_get_returns_grouped_roles(self):
+        self.config["nickname_mappings"] = MultiNicknameTests.ROWS
+        status, body = self.call(self.view.view_get_nicknames())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["roles"]), 2)
+        self.assertEqual(body["roles"][0]["nicknames"], ["张三", "老三", "ZHANG"])
+
+    def test_save_accepts_grouped_roles(self):
+        status, body = self.roles_payload(
+            dict(role_id="123456", role_name="张三", server="163", nicknames=["张三", "老三"]),
+            dict(role_id="654321", role_name="李四", server="163", nicknames=["李四"]),
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["saved"])
+        saved_rows = body["nickname_mappings"]
+        self.assertEqual([row["nickname"] for row in saved_rows], ["张三", "老三", "李四"])
+        self.assertTrue(all(row["role_id"] for row in saved_rows))
+        disk = json.loads(self.config.path.read_text(encoding="utf-8"))
+        self.assertEqual(len(disk["nickname_mappings"]), 3)
+
+    def test_saved_aliases_all_resolve(self):
+        self.roles_payload(dict(role_id="123456", nicknames=["张三", "老三"]))
+        for alias in ("张三", "老三"):
+            self.assertIsNotNone(nickname_lookup(self.config, alias), alias)
+
+    def test_role_without_nickname_is_rejected(self):
+        before = copy.deepcopy(dict(self.config))
+        status, message = self.roles_payload(dict(role_id="123456", nicknames=["  "]))
+        self.assertEqual(status, 400)
+        self.assertIn("至少要保留一个昵称", message)
+        self.assertEqual(dict(self.config), before)
+
+    def test_roles_must_be_a_list(self):
+        self.payload = dict(revision=mapping_snapshot(self.config)["revision"], roles="oops")
+        status, message = self.call(self.view.view_save_nicknames())
+        self.assertEqual(status, 400)
+        self.assertIn("roles", message)
+
+    def test_roles_items_must_be_objects(self):
+        status, message = self.roles_payload("oops")
+        self.assertEqual(status, 400)
+        self.assertIn("必须是对象", message)
+
+    def test_grouped_save_still_guards_stale_editors(self):
+        stale = dict(revision="deadbeef", roles=[dict(role_id="123456", nicknames=["张三"])])
+        self.payload = stale
+        status, _ = self.call(self.view.view_save_nicknames())
+        self.assertEqual(status, 409)
+        self.assertEqual(self.config["nickname_mappings"], [])
+
+
+class PanelMultiNicknameTests(unittest.TestCase):
+    def test_panel_renders_nickname_chips(self):
+        js = (ROOT / "pages/nicknames/app.js").read_text(encoding="utf-8")
+        for token in ("nicknames", "chip-remove", "nickname-add", "roles"):
+            self.assertIn(token, js, token)
+        self.assertIn("readOnly", js)
+        css = (ROOT / "pages/nicknames/style.css").read_text(encoding="utf-8")
+        for token in (".chip", ".chips", ".nickname-add"):
+            self.assertIn(token, css, token)
 
 
 if __name__ == "__main__":

@@ -113,6 +113,56 @@ def validate_nickname_mappings(entries) -> list[dict]:
     return normalized
 
 
+def group_nickname_rows(entries) -> list[dict]:
+    """把「一行一个昵称」的扁平表聚合成「一个角色多个昵称」。
+
+    配置文件里仍然保持扁平（一行一个昵称），这样模板列表可以直接编辑、
+    也方便人工改文件；面板只负责展示和编辑聚合视图。
+    """
+    groups, seen_roles = [], {}
+    for row in entries if isinstance(entries, list) else []:
+        if not isinstance(row, dict):
+            continue
+        role_id = str(row.get("role_id") or "").strip()
+        nickname = str(row.get("nickname") or "").strip()
+        if not role_id or not nickname:
+            continue
+        group = seen_roles.get(role_id)
+        if group is None:
+            group = {"role_id": role_id, "role_name": "", "server": "", "nicknames": []}
+            seen_roles[role_id] = group
+            groups.append(group)
+        for field in ("role_name", "server"):
+            if not group[field]:
+                text = str(row.get(field) or "").strip()
+                if text:
+                    group[field] = text
+        key = _normalize_nickname(nickname)
+        if key and all(_normalize_nickname(item) != key for item in group["nicknames"]):
+            group["nicknames"].append(nickname)
+    return groups
+
+
+def flatten_nickname_groups(groups) -> list[dict]:
+    """把面板的聚合视图摊回配置使用的扁平表；空昵称的角色会被丢弃。"""
+    rows = []
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            rows.append(group)
+            continue
+        role_id = group.get("role_id")
+        role_name = group.get("role_name")
+        server = group.get("server")
+        for nickname in group.get("nicknames") or []:
+            row = {"nickname": nickname, "role_id": role_id}
+            if role_name:
+                row["role_name"] = role_name
+            if server:
+                row["server"] = server
+            rows.append(row)
+    return rows
+
+
 def nickname_lookup(config, nickname: str) -> dict | None:
     """按归一化昵称查已保存的 role_id；没配就返回 None。"""
     key = _normalize_nickname(nickname)
