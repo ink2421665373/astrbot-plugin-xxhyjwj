@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image, ImageDraw, ImageFont
 from report_image import FONT_PATH, WIDTH, _blocks, _wrap, render_report_images
-from delivery import split_message, save_originals
+from delivery import slice_poster, split_message, save_originals
 
 
 class ReportImageTests(unittest.TestCase):
@@ -81,14 +81,14 @@ class ReportImageTests(unittest.TestCase):
     def plugin(self, config):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
         source = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_body" for f in n.body))
-        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode")]
+        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_split_height", "_image_pages")]
         cls = ast.ClassDef(name="Plugin", bases=[], keywords=[], body=methods, decorator_list=[])
         components = SimpleNamespace(Reply=lambda **kw: ("reply", kw), Plain=lambda text: ("plain", text),
                                      Image=SimpleNamespace(fromBytes=lambda image: ("image", image)),
                                      File=lambda **kwargs: ("file", kwargs))
         env = dict(asyncio=asyncio, base64=base64, AstrMessageEvent=object, Comp=components,
                    render_report_images=lambda text: [b"png"], logger=logging.getLogger(__name__),
-                   split_message=split_message, save_originals=save_originals)
+                   split_message=split_message, save_originals=save_originals, slice_poster=slice_poster)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
         plugin = env["Plugin"]()
         plugin.config = config
@@ -208,20 +208,31 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(result, [("image", b"png")])
         event.send.assert_not_awaited()
 
-    def test_auto_mode_sends_png_file_on_wechat(self):
+    def test_auto_mode_keeps_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
-        with tempfile.TemporaryDirectory() as directory:
-            plugin._original_image_dir = Path(directory)
-            event = self.wechat_event()
-            captured = []
-            async def send(chain):
-                captured.append(chain)
-            event.send.side_effect = send
-            self.assertIsNone(asyncio.run(plugin._body(event, "完整报告")))
-            self.assertEqual(len(captured), 1)
-            self.assertEqual(captured[0][0][0], "file")
-            self.assertEqual(Path(captured[0][0][1]["file"]).read_bytes(), b"png")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
+        self.assertEqual(plugin._image_split_height(self.event()), 0)
+        event = self.wechat_event()
+        result = asyncio.run(plugin._body(event, "完整报告"))
+        self.assertEqual(result, [("image", b"png")])
+        event.send.assert_not_awaited()
+
+    def test_wechat_long_poster_is_split_into_pages(self):
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        tall = Image.new("RGB", (1080, 2400), "#f2efe7")
+        ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
+        buffer = BytesIO()
+        tall.save(buffer, format="PNG")
+        env["render_report_images"] = lambda text: [buffer.getvalue()]
+        event = self.wechat_event()
+        result = asyncio.run(plugin._body(event, "完整报告"))
+        self.assertGreaterEqual(len(result), 3)
+        for _, page in result:
+            with Image.open(BytesIO(page)) as image:
+                self.assertLessEqual(image.height, 900)
+        qq = asyncio.run(plugin._body(self.event(), "完整报告"))
+        self.assertEqual(len(qq), 1)
 
     def test_explicit_inline_mode_overrides_wechat_auto(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain", image_send_mode="内嵌图片"))
@@ -246,7 +257,24 @@ class ReportImageTests(unittest.TestCase):
         plugin, _ = self.plugin(dict(send_original_image_file=True))
         self.assertEqual(plugin._image_send_mode(self.event()), "两者都发")
         plugin, _ = self.plugin(dict())
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
+
+    def test_slice_poster_keeps_every_pixel_and_cuts_on_blank_rows(self):
+        canvas = Image.new("RGB", (200, 1000), "#f2efe7")
+        draw = ImageDraw.Draw(canvas)
+        for y in range(0, 1000, 100):
+            draw.rectangle((0, y, 200, y + 40), fill="#252722")
+        buffer = BytesIO()
+        canvas.save(buffer, format="PNG")
+        pages = slice_poster(buffer.getvalue(), 300)
+        self.assertGreaterEqual(len(pages), 4)
+        total = 0
+        for page in pages:
+            with Image.open(BytesIO(page)) as image:
+                self.assertLessEqual(image.height, 300)
+                total += image.height
+        self.assertEqual(total, 1000)
+        self.assertEqual(slice_poster(buffer.getvalue(), 0), [buffer.getvalue()])
 
 
 if __name__ == "__main__":

@@ -407,13 +407,15 @@ class NarakaToolMixin:
             except _TOOL_IMAGE_ERRORS as exc:
                 logger.warning(f"[naraka][tool] 原图文件发送失败，已保留文字结果：{type(exc).__name__}")
             return
+        pages_of = getattr(self, "_image_pages", None)
+        pages = pages_of(event, images) if callable(pages_of) else images
         try:
             chain = []
             if self.result_method() == "quote":
                 message_id = self._message_id(event)
                 if message_id:
                     chain.append(Comp.Reply(id=message_id))
-            chain.extend(Comp.Image.fromBytes(image) for image in images)
+            chain.extend(Comp.Image.fromBytes(image) for image in pages)
             await event.send(event.chain_result(chain))
         except _TOOL_IMAGE_ERRORS as exc:  # 发送失败：文本结果已经可用
             logger.warning(f"[naraka][tool] 长图发送失败，已保留文字结果：{type(exc).__name__}")

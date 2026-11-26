@@ -1,7 +1,8 @@
 """Text fallback, throttled progress and original PNG file management."""
-from pathlib import Path
 import asyncio
+import io
 import time
+from pathlib import Path
 from uuid import uuid4
 
 
@@ -69,6 +70,46 @@ class QueryProgress:
             return False
         self.last = now
         return True
+
+
+def slice_poster(image: bytes, max_height: int, *, min_height_ratio: float = 0.7) -> list[bytes]:
+    """把过长的战报切成几张，每张不超过 max_height，优先切在空白行上。
+
+    微信等平台会把内嵌图片压得很小，一张两千多像素高的长图压完文字全糊；
+    切成几张后每张都能拿到一份压缩预算，字就清楚得多。切点落在空白行，
+    不会把某一行文字切成两半。
+    """
+    from PIL import Image
+
+    if max_height <= 0:
+        return [image]
+    with Image.open(io.BytesIO(image)) as source:
+        canvas = source.convert("RGB")
+        width, height = canvas.size
+        if height <= max_height:
+            return [image]
+        paper = bytes(canvas.getpixel((0, 0)))
+        blank_row = paper * width
+        pages, top = [], 0
+        while height - top > max_height:
+            limit = top + max_height
+            floor = min(limit, top + int(max_height * min_height_ratio))
+            cut = None
+            for y in range(limit, floor, -1):
+                if canvas.crop((0, y, width, y + 1)).tobytes() == blank_row:
+                    cut = y
+                    break
+            if cut is None:
+                cut = limit
+            pages.append(canvas.crop((0, top, width, cut)))
+            top = cut
+        pages.append(canvas.crop((0, top, width, height)))
+        out = []
+        for page in pages:
+            buffer = io.BytesIO()
+            page.save(buffer, format="PNG")
+            out.append(buffer.getvalue())
+        return out
 
 
 def save_originals(directory, images, *, now=None):

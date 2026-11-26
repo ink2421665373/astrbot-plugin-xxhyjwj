@@ -31,7 +31,7 @@ import astrbot.api.message_components as Comp
 
 from .binding import BindingManager
 from .ai_analysis import AIAnalysisMixin, build_analysis_data
-from .delivery import QueryProgress, save_originals, split_message
+from .delivery import QueryProgress, save_originals, slice_poster, split_message
 from .auth_state import read_saved_auth
 from .mapping_config import ensure_template_keys, merge_season_options, nickname_lookup
 from .mapping_views import MappingViewMixin
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.9")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.10")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -533,24 +533,51 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def _image_send_mode(self, event: AstrMessageEvent | None = None) -> str:
         """图片投递方式：自动 / 内嵌图片 / 原图文件 / 两者都发。
 
-        微信守护进程会把内嵌图片压到 64KB 以内，长图糊到看不清，所以「自动」
-        在微信平台直接发 PNG 原图文件（一条、清晰）；QQ 等平台仍发内嵌图片。
-        旧配置 ``send_original_image_file`` 仍兼容：为真时按「两者都发」处理。
+        「自动」= 内嵌图片（微信会再按 ``image_split_height`` 切页，避免被压糊）；
+        想只收一个清晰文件时选「原图文件」。旧配置 ``send_original_image_file``
+        仍兼容：为真时按「两者都发」处理。
         """
         raw = str(self.config.get("image_send_mode", "") or "").strip()
         if raw in ("内嵌图片", "原图文件", "两者都发"):
             return raw
         if self.config.get("send_original_image_file", False) is True:
             return "两者都发"
+        return "内嵌图片"
+
+    def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:
+        """微信内嵌图会被压到几十 KB，长图必然糊：按高度切页，让每页都清晰。
+
+        只在微信平台生效（QQ 不压这么狠，整张发更省事）；返回 0 表示不切。
+        """
         name = ""
         if event is not None:
             try:
                 name = str(event.get_platform_name() or "").lower()
             except (AttributeError, TypeError):
                 name = ""
-        if "wechat" in name:
-            return "原图文件"
-        return "内嵌图片"
+        if "wechat" not in name:
+            return 0
+        raw = self.config.get("image_split_height", 900)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 900
+        if value <= 0:
+            return 0
+        return max(400, min(value, 3000))
+
+    def _image_pages(self, event: AstrMessageEvent | None, images: list[bytes]) -> list[bytes]:
+        """按平台把长图切成多页；切不开或不需要时原样返回。"""
+        height = self._image_split_height(event)
+        if height <= 0:
+            return images
+        pages: list[bytes] = []
+        for image in images:
+            try:
+                pages.extend(slice_poster(image, height))
+            except (OSError, ValueError):
+                pages.append(image)
+        return pages or images
 
     async def _body(self, event: AstrMessageEvent, message: str, first: bool = False, progress=None):
         """战绩正文；first=False 时不 @（at 只加在第一条分条上）。"""
@@ -574,15 +601,16 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             if send_mode == "原图文件":
                 return await self._send_original_images(event, images)
             original_file = send_mode == "两者都发"
+            pages = self._image_pages(event, images)
             if method in ("at", "mention"):
-                if await self._send_at(event, "", images=images):
+                if await self._send_at(event, "", images=pages):
                     return await self._send_original_images(event, images) if original_file else None
             chain = []
             if method == "quote":
                 message_id = self._message_id(event)
                 if message_id:
                     chain.append(Comp.Reply(id=message_id))
-            chain.extend(Comp.Image.fromBytes(image) for image in images)
+            chain.extend(Comp.Image.fromBytes(image) for image in pages)
             result = event.chain_result(chain)
             if original_file:
                 await event.send(result)
