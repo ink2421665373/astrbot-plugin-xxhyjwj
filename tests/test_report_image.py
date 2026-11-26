@@ -278,5 +278,39 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(slice_poster(buffer.getvalue(), 0), [buffer.getvalue()])
 
 
+class CrispRenderingTests(unittest.TestCase):
+    """微信把内嵌图压到 64KB：默认给字描边 + 纯白底，压完还认得出。"""
+
+    def setUp(self):
+        import poster_image
+        self.poster = poster_image
+        self.addCleanup(poster_image.configure, stroke=1, plain_paper=True)
+
+    def test_configure_toggles_stroke_and_paper(self):
+        self.poster.configure(stroke=0, plain_paper=False)
+        self.assertEqual(self.poster._STROKE, 0)
+        self.assertFalse(self.poster._PLAIN_PAPER)
+        self.poster.configure(stroke=1, plain_paper=True)
+        self.assertEqual(self.poster._STROKE, 1)
+        self.assertTrue(self.poster._PLAIN_PAPER)
+
+    def test_stroke_is_clamped(self):
+        self.poster.configure(stroke=9, plain_paper=True)
+        self.assertEqual(self.poster._STROKE, 3)
+
+    def test_crisp_mode_draws_on_white_paper(self):
+        self.poster.configure(stroke=1, plain_paper=True)
+        page = render_report_images("昵称：示例玩家\nID：123\n当前赛季概览\n排位 · 单排：3000 排位 · 双排：3200 排位 · 三排：5326")[0]
+        with Image.open(BytesIO(page)) as image:
+            # 左上角页面背景应为纯白（水墨纸纹被关掉）
+            self.assertEqual(image.convert("RGB").getpixel((2, 2)), (255, 255, 255))
+
+    def test_plain_paper_switch_keeps_texture(self):
+        self.poster.configure(stroke=0, plain_paper=False)
+        page = render_report_images("昵称：示例玩家\nID：123\n当前赛季概览\n排位 · 单排：3000")[0]
+        with Image.open(BytesIO(page)) as image:
+            self.assertNotEqual(image.convert("RGB").getpixel((2, 2)), (255, 255, 255))
+
+
 if __name__ == "__main__":
     unittest.main()

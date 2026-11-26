@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.11")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.12")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -231,8 +231,22 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             pace=self._bind_pace,
         )
         self._bind_llm_tool_handlers()
+        self._configure_poster()
 
     # ==================== 配置 ====================
+
+    def _configure_poster(self) -> None:
+        """微信把内嵌图压到 64KB 以内：默认给文字描边 + 纯白底，压完仍认得出字。
+
+        关掉 ``image_crisp`` 就回到原来的水墨纸纹风格（更雅，但压缩后更软）。
+        """
+        try:
+            from . import poster_image
+        except ImportError:  # pragma: no cover - 直接单文件运行时的兜底
+            return
+        raw = self.config.get("image_crisp", True)
+        crisp = str(raw).strip().lower() not in ("false", "0", "no", "off", "")
+        poster_image.configure(stroke=1 if crisp else 0, plain_paper=crisp)
 
     def _repair_nickname_template_keys(self) -> None:
         """给早期版本写下的裸昵称行补 ``__template_key``。

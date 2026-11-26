@@ -17,6 +17,28 @@ def _font(size, brush=False):
     return ImageFont.truetype(str(FONT_DIR / ("MaShanZheng-Regular.ttf" if brush else "NotoSansCJKsc-Regular.otf")), size)
 
 
+# 微信会把内嵌图压到 64KB 以内，笔画太细的字压完就糊成一团。
+# 这里给正文描一圈同色边（伪加粗），并把纸张换成纯白，让压缩预算尽量花在字上。
+_STROKE = 1
+_PLAIN_PAPER = True
+
+
+def configure(*, stroke: int = 1, plain_paper: bool = True) -> None:
+    """按配置调整渲染风格：stroke=0 关掉描边，plain_paper=False 恢复水墨纸纹。"""
+    global _STROKE, _PLAIN_PAPER
+    _STROKE = max(0, min(int(stroke), 3))
+    _PLAIN_PAPER = bool(plain_paper)
+
+
+def _dt(draw, xy, text, font=None, fill=None, **kwargs):
+    """带描边的文字绘制：小字号（<22px）不加描边，避免糊成一块。"""
+    stroke = _STROKE if (font is not None and getattr(font, "size", 0) >= 22) else 0
+    if stroke:
+        kwargs.setdefault("stroke_width", stroke)
+        kwargs.setdefault("stroke_fill", fill)
+    return draw.text(xy, text, font=font, fill=fill, **kwargs)
+
+
 def _wrap(text, font, width):
     output = []
     for line in str(text).splitlines() or [""]:
@@ -31,7 +53,7 @@ def _wrap(text, font, width):
 
 
 def _tile(height):
-    return Image.new("RGB", (CW, height), PAPER)
+    return Image.new("RGB", (CW, height), "#ffffff" if _PLAIN_PAPER else PAPER)
 
 
 def _text(text, size=24, color=INK, indent=0):
@@ -43,7 +65,7 @@ def _text(text, size=24, color=INK, indent=0):
         tile = _tile(16 + len(part) * (size + 12))
         draw = ImageDraw.Draw(tile)
         for row, line in enumerate(part):
-            draw.text((indent, 4 + row * (size + 12)), line, font=font, fill=color)
+            _dt(draw, (indent, 4 + row * (size + 12)), line, font=font, fill=color)
         tiles.append(tile)
     return tiles
 
@@ -56,13 +78,15 @@ def _heading(text):
     draw = ImageDraw.Draw(tile)
     draw.rectangle((0, 18, 6, 44), fill=RED)
     for row, line in enumerate(lines):
-        draw.text((23, 7 + row * 36), line, font=font, fill=INK)
+        _dt(draw, (23, 7 + row * 36), line, font=font, fill=INK)
     draw.line((23, tile.height - 4, CW, tile.height - 4), fill=RULE)
     return tile
 
 
 def _wash(width, height):
     """Soft, irregular ink ridges rather than geometric mountain icons."""
+    if _PLAIN_PAPER:
+        return Image.new("RGB", (width, height), "#ffffff")
     layer = Image.new("RGB", (width, height), PAPER)
     draw = ImageDraw.Draw(layer)
     rng = random.Random(74)
@@ -104,14 +128,14 @@ def _metrics(pairs, columns=4, core=False):
         for col, (label, value, labels, values, vf, coverage) in enumerate(layouts):
             x = col * width
             for row, text in enumerate(labels):
-                draw.text((x, 9 + row * 28), text, font=_font(20), fill=MUTED)
+                _dt(draw, (x, 9 + row * 28), text, font=_font(20), fill=MUTED)
             color = RED if label in ("伤害", "分数", "当前模式分数") or "场均伤害" in label else INK
             if label == "积分变化" and value != "—":
                 color = "#3e745a" if value.startswith("+") else RED
             for row, text in enumerate(values):
-                draw.text((x, 16 + len(labels) * 28 + row * (vf.size + 8)), text, font=vf, fill=color)
+                _dt(draw, (x, 16 + len(labels) * 28 + row * (vf.size + 8)), text, font=vf, fill=color)
             for row, text in enumerate(coverage):
-                draw.text((x, 16 + len(labels) * 28 + len(values) * (vf.size + 8) + row * 25), text, font=_font(18), fill=MUTED)
+                _dt(draw, (x, 16 + len(labels) * 28 + len(values) * (vf.size + 8) + row * 25), text, font=_font(18), fill=MUTED)
             if col and core:
                 draw.line((x - 20, 22, x - 20, height - 15), fill=RULE)
         draw.line((0, height - 2, CW, height - 2), fill=RULE)
@@ -134,21 +158,21 @@ def _banner(title, subtitle, right_label="", right_value="", notes=None):
     wash = _wash(CW, 105)
     tile.paste(wash, (0, height - 105))
     draw = ImageDraw.Draw(tile)
-    draw.text((0, 8), subtitle, font=_font(22), fill=MUTED)
+    _dt(draw, (0, 8), subtitle, font=_font(22), fill=MUTED)
     for row, line in enumerate(title_lines):
-        draw.text((-3, 49 + row * (brush.size + 8)), line, font=brush, fill=INK)
+        _dt(draw, (-3, 49 + row * (brush.size + 8)), line, font=brush, fill=INK)
     if right_value:
         x = 690
         for row, line in enumerate(_wrap(right_label, _font(18), CW - x)):
-            draw.text((x, 9 + row * 24), line, font=_font(18), fill=MUTED)
+            _dt(draw, (x, 9 + row * 24), line, font=_font(18), fill=MUTED)
         score_font = _font(82 if len(right_value) <= 5 else 54)
         score_lines = _wrap(right_value, score_font, CW - x)
         if len(score_lines) <= 2:
             for row, line in enumerate(score_lines):
-                draw.text((x, 58 + row * 82), line, font=score_font, fill=RED)
+                _dt(draw, (x, 58 + row * 82), line, font=score_font, fill=RED)
         else:
             overflow_value = f"{right_label}：{right_value}"
-            draw.text((x, 67), "详见下方", font=_font(22), fill=RED)
+            _dt(draw, (x, 67), "详见下方", font=_font(22), fill=RED)
     else:
         score_lines = []
     if notes:
@@ -156,7 +180,7 @@ def _banner(title, subtitle, right_label="", right_value="", notes=None):
         note_text = "  ·  ".join(notes)
         note_lines = _wrap(note_text, _font(21), CW - 15)
         for row, line in enumerate(note_lines[:2]):
-            draw.text((0, height - 67 + row * 30), line, font=_font(21), fill=MUTED)
+            _dt(draw, (0, height - 67 + row * 30), line, font=_font(21), fill=MUTED)
         overflow = note_lines[2:]
     else:
         overflow = []
@@ -174,10 +198,10 @@ def _hero(text):
         return _text(text)
     tile = _tile(67)
     draw = ImageDraw.Draw(tile)
-    draw.text((0, 12), rank.zfill(2), font=_font(21), fill=RED)
-    draw.text((60, 5), name, font=font, fill=INK)
+    _dt(draw, (0, 12), rank.zfill(2), font=_font(21), fill=RED)
+    _dt(draw, (60, 5), name, font=font, fill=INK)
     value = f"{count} 场"
-    draw.text((CW - font.getlength(value), 5), value, font=font, fill=MUTED)
+    _dt(draw, (CW - font.getlength(value), 5), value, font=font, fill=MUTED)
     draw.line((60, 62, CW, 62), fill=RULE)
     return [tile]
 
@@ -274,10 +298,10 @@ def render_poster_pages(report, blocks):
     output = []
     for index, page in enumerate(pages, 1):
         height = 150 + sum(tile.height + 6 for tile in identity_tiles) + sum(tile.height + 10 for tile in page)
-        image = Image.new("RGB", (WIDTH, height), PAPER)
+        image = Image.new("RGB", (WIDTH, height), "#ffffff" if _PLAIN_PAPER else PAPER)
         draw = ImageDraw.Draw(image)
-        draw.text((MARGIN, 13), "永劫无间", font=_font(38, True), fill=INK)
-        draw.text((WIDTH - 260, 29), "战报  /  NARAKA", font=_font(18), fill=MUTED)
+        _dt(draw, (MARGIN, 13), "永劫无间", font=_font(38, True), fill=INK)
+        _dt(draw, (WIDTH - 260, 29), "战报  /  NARAKA", font=_font(18), fill=MUTED)
         draw.line((MARGIN, 67, WIDTH - MARGIN, 67), fill=INK, width=2)
         y = 81
         for tile in identity_tiles:
@@ -289,9 +313,9 @@ def render_poster_pages(report, blocks):
             y += tile.height + 10
         draw.line((MARGIN, height - 40, WIDTH - MARGIN, height - 40), fill=RULE)
         footer = "小黑盒战绩  /  AI评价仅供参考  /  — 表示数据缺失" if ai_tail else "小黑盒数据  /  — 表示数据缺失或无可展示内容"
-        draw.text((MARGIN, height - 33), footer, font=_font(17), fill=MUTED)
+        _dt(draw, (MARGIN, height - 33), footer, font=_font(17), fill=MUTED)
         page_number = f"{index:02} / {len(pages):02}"
-        draw.text((WIDTH - MARGIN - _font(17).getlength(page_number), height - 33), page_number, font=_font(17), fill=RED)
+        _dt(draw, (WIDTH - MARGIN - _font(17).getlength(page_number), height - 33), page_number, font=_font(17), fill=RED)
         target = BytesIO()
         image.save(target, format="PNG")
         output.append(target.getvalue())
