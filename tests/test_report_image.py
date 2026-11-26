@@ -211,7 +211,7 @@ class ReportImageTests(unittest.TestCase):
     def test_auto_mode_keeps_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
-        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 0)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
         event = self.wechat_event()
         result = asyncio.run(plugin._body(event, "完整报告"))
@@ -219,7 +219,8 @@ class ReportImageTests(unittest.TestCase):
         event.send.assert_not_awaited()
 
     def test_wechat_long_poster_is_split_into_pages(self):
-        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain", image_split_height=900))
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
         tall = Image.new("RGB", (1080, 2400), "#f2efe7")
         ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
         buffer = BytesIO()

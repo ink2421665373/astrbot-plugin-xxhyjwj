@@ -327,6 +327,48 @@ class NarakaToolMixin:
             return "naraka"
         return ""
 
+    def _nickname_in_text(self, text: str) -> str:
+        """消息里出现的已登记昵称（用于回执文案），没有就返回空串。"""
+        from .mapping_config import nickname_key
+
+        entries = self.config.get("nickname_mappings", [])
+        if not isinstance(entries, list):
+            return ""
+        haystack = nickname_key(text)
+        if not haystack:
+            return ""
+        best = ""
+        for row in entries:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("nickname") or "").strip()
+            key = nickname_key(name)
+            if key and key in haystack and len(name) > len(best):
+                best = name
+        return best
+
+    async def _ack_early(self, event) -> None:
+        """模型还在排队时就把「正在翻 X 的战绩」发出去。
+
+        工具要等模型决定调用之后才执行，那已经是好几秒以后；这个钩子在请求刚确定
+        要走模型时就跑，用户几乎立刻能看到回执。判定条件尽量保守：只认登记过的
+        昵称或明确的永劫词，剑三消息一个字不动。
+        """
+        if not self._hint_guard_ready() or not self._tool_notice_enabled():
+            return
+        if self._already_acked(event):
+            return
+        try:
+            text = str(event.get_message_str() or "")
+        except (AttributeError, TypeError):
+            return
+        if not text.strip():
+            return
+        nickname = self._nickname_in_text(text)
+        if not nickname and self._game_of_message(text) != "naraka":
+            return
+        await self._tool_ack(event, nickname)
+
     async def _strip_foreign_hints(self, event: AstrMessageEvent, request) -> None:
         """把其它插件（当前是剑三插件）误注入到本次请求里的提示清掉。
 

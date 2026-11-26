@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.10")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.11")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -545,7 +545,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         return "内嵌图片"
 
     def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:
-        """微信内嵌图会被压到几十 KB，长图必然糊：按高度切页，让每页都清晰。
+        """微信内嵌图会被压到几十 KB：设了高度才切页，默认 0＝保持一张长图。
 
         只在微信平台生效（QQ 不压这么狠，整张发更省事）；返回 0 表示不切。
         """
@@ -557,11 +557,11 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 name = ""
         if "wechat" not in name:
             return 0
-        raw = self.config.get("image_split_height", 900)
+        raw = self.config.get("image_split_height", 0)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return 900
+            return 0
         if value <= 0:
             return 0
         return max(400, min(value, 3000))
@@ -799,6 +799,21 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         正好排在剑三插件（默认 0）之后，能读到它改完的 prompt。
         """
         await self._strip_foreign_hints(event, request)
+
+    @filter.on_waiting_llm_request(priority=100)
+    async def ack_naraka_query_early(self, event: AstrMessageEvent):
+        """模型还在排队时先回一句「正在翻 X 的战绩」，别让用户干等。
+
+        工具要等模型决定要不要调用之后才执行，那通常已经是好几秒之后；
+        这个钩子在「确定要走模型」的瞬间触发，回执几乎立刻可见。
+        必须返回 None：返回非空值会让 AstrBot 认为事件已被处理、直接跳过 LLM。
+        同模块原因见上面 ``strip_foreign_game_hints``。
+        """
+        try:
+            await self._ack_early(event)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+            logger.warning(f"[naraka] 提前回执失败已忽略：{type(exc).__name__}")
+        return None
 
     # ==================== 指令分发 ====================
 

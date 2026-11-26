@@ -1003,5 +1003,90 @@ class ToolNoticeTests(unittest.TestCase):
             self.assertEqual(data[key].get("type"), kind)
 
 
+class EarlyAckTests(unittest.TestCase):
+    """模型还没开始想的时候就把回执发出去，别让用户等好几秒。"""
+
+    @classmethod
+    def setUpClass(cls):
+        stub_dir = ROOT / "tests"
+        sys.path.insert(0, str(stub_dir))
+        if "astrbot" not in sys.modules:
+            import astrbot_stub  # noqa: F401
+        cls.tools = importlib.import_module("naraka_test_package.tools")
+
+    def make(self, text, **config):
+        obj = make_mixin(**config)
+        obj.sent = []
+        obj.pushed = []
+
+        async def reply(event, message, method=None):
+            obj.sent.append(message)
+            return ("result", message, method)
+
+        obj._reply = reply
+        store = {}
+
+        class Event:
+            def get_message_str(self):
+                return text
+
+            def get_extra(self, key, default=None):
+                return store.get(key, default)
+
+            def set_extra(self, key, value):
+                store[key] = value
+
+            async def send(self, result):
+                obj.pushed.append(result)
+
+        return obj, Event()
+
+    def run_async(self, awaitable):
+        return asyncio.new_event_loop().run_until_complete(awaitable)
+
+    def test_mapped_nickname_triggers_early_ack(self):
+        obj, event = self.make("查一下李知恩的三排战绩",
+                               enable_llm_tools=True,
+                               nickname_mappings=[dict(nickname="李知恩", role_id="95bs000012710300280163")])
+        self.run_async(obj._ack_early(event))
+        self.assertEqual(obj.sent, ["正在翻 李知恩 的战绩，请稍等…"])
+        self.assertEqual(len(obj.pushed), 1)
+
+    def test_naraka_keyword_without_nickname_still_acks(self):
+        obj, event = self.make("来个永劫战绩", enable_llm_tools=True,
+                               llm_tool_notice_fallback="正在查战绩，请稍等…")
+        self.run_async(obj._ack_early(event))
+        self.assertEqual(obj.sent, ["正在查战绩，请稍等…"])
+
+    def test_jx3_message_is_left_alone(self):
+        obj, event = self.make("查一下梦江南的33战绩", enable_llm_tools=True)
+        self.run_async(obj._ack_early(event))
+        self.assertEqual(obj.sent, [])
+
+    def test_plain_chat_is_left_alone(self):
+        obj, event = self.make("今天天气不错", enable_llm_tools=True)
+        self.run_async(obj._ack_early(event))
+        self.assertEqual(obj.sent, [])
+
+    def test_early_ack_blocks_later_tool_ack(self):
+        obj, event = self.make("查一下李知恩的战绩", enable_llm_tools=True,
+                               nickname_mappings=[dict(nickname="李知恩", role_id="95bs000012710300280163")])
+        self.run_async(obj._ack_early(event))
+        self.run_async(obj._tool_ack(event, "李知恩"))  # 工具再想回执一次也不行
+        self.assertEqual(len(obj.sent), 1)
+
+    def test_switch_off_sends_nothing(self):
+        obj, event = self.make("查一下永劫战绩", enable_llm_tools=True, llm_tool_start_notice=False)
+        self.run_async(obj._ack_early(event))
+        self.assertEqual(obj.sent, [])
+
+    def test_main_hook_returns_none_so_llm_still_runs(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8-sig")
+        self.assertIn("on_waiting_llm_request", source)
+        self.assertIn("ack_naraka_query_early", source)
+        self.assertIn("await self._ack_early(event)", source)
+        self.assertIn("return None", source.split("ack_naraka_query_early", 1)[1])
+
+
 if __name__ == "__main__":
     unittest.main()
