@@ -398,6 +398,15 @@ class NarakaToolMixin:
             return
         if not images:
             return
+        mode_of = getattr(self, "_image_send_mode", None)
+        send_mode = mode_of(event) if callable(mode_of) else "内嵌图片"
+        if send_mode == "原图文件":
+            # 微信守护进程会把内嵌图压到 64KB 以内，长图糊得看不清：直接发原图文件。
+            try:
+                await self._send_original_images(event, images)
+            except _TOOL_IMAGE_ERRORS as exc:
+                logger.warning(f"[naraka][tool] 原图文件发送失败，已保留文字结果：{type(exc).__name__}")
+            return
         try:
             chain = []
             if self.result_method() == "quote":
@@ -409,7 +418,7 @@ class NarakaToolMixin:
         except _TOOL_IMAGE_ERRORS as exc:  # 发送失败：文本结果已经可用
             logger.warning(f"[naraka][tool] 长图发送失败，已保留文字结果：{type(exc).__name__}")
             return
-        if self.config.get("send_original_image_file", False) is True:
+        if send_mode == "两者都发":
             await self._send_original_images(event, images)
 
     @staticmethod

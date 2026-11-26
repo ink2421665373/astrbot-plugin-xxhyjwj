@@ -1,4 +1,4 @@
-"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.8")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.9")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -530,6 +530,28 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             return event.plain_result("原图文件发送失败，图片结果已保留。请检查适配器文件支持，以及跨容器部署时的文件访问配置。")
         return None
 
+    def _image_send_mode(self, event: AstrMessageEvent | None = None) -> str:
+        """图片投递方式：自动 / 内嵌图片 / 原图文件 / 两者都发。
+
+        微信守护进程会把内嵌图片压到 64KB 以内，长图糊到看不清，所以「自动」
+        在微信平台直接发 PNG 原图文件（一条、清晰）；QQ 等平台仍发内嵌图片。
+        旧配置 ``send_original_image_file`` 仍兼容：为真时按「两者都发」处理。
+        """
+        raw = str(self.config.get("image_send_mode", "") or "").strip()
+        if raw in ("内嵌图片", "原图文件", "两者都发"):
+            return raw
+        if self.config.get("send_original_image_file", False) is True:
+            return "两者都发"
+        name = ""
+        if event is not None:
+            try:
+                name = str(event.get_platform_name() or "").lower()
+            except (AttributeError, TypeError):
+                name = ""
+        if "wechat" in name:
+            return "原图文件"
+        return "内嵌图片"
+
     async def _body(self, event: AstrMessageEvent, message: str, first: bool = False, progress=None):
         """战绩正文；first=False 时不 @（at 只加在第一条分条上）。"""
         method = self.result_method()
@@ -548,7 +570,10 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 return await self._send_text_fallback(event, message, method)
             if progress:
                 await progress.close()
-            original_file = self.config.get("send_original_image_file", False) is True
+            send_mode = self._image_send_mode(event)
+            if send_mode == "原图文件":
+                return await self._send_original_images(event, images)
+            original_file = send_mode == "两者都发"
             if method in ("at", "mention"):
                 if await self._send_at(event, "", images=images):
                     return await self._send_original_images(event, images) if original_file else None

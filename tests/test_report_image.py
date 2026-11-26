@@ -81,7 +81,7 @@ class ReportImageTests(unittest.TestCase):
     def plugin(self, config):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
         source = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_body" for f in n.body))
-        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images")]
+        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode")]
         cls = ast.ClassDef(name="Plugin", bases=[], keywords=[], body=methods, decorator_list=[])
         components = SimpleNamespace(Reply=lambda **kw: ("reply", kw), Plain=lambda text: ("plain", text),
                                      Image=SimpleNamespace(fromBytes=lambda image: ("image", image)),
@@ -194,6 +194,59 @@ class ReportImageTests(unittest.TestCase):
         setting = schema["result_display_format"]
         self.assertEqual(setting["options"], ["文字", "图片"])
         self.assertEqual(setting["default"], "文字")
+
+    def wechat_event(self):
+        event = self.event()
+        event.get_platform_name = lambda: "wechat_agent"
+        return event
+
+    def test_auto_mode_sends_inline_image_on_qq(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        self.assertEqual(plugin._image_send_mode(self.event()), "内嵌图片")
+        event = self.event()
+        result = asyncio.run(plugin._body(event, "完整报告"))
+        self.assertEqual(result, [("image", b"png")])
+        event.send.assert_not_awaited()
+
+    def test_auto_mode_sends_png_file_on_wechat(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
+        with tempfile.TemporaryDirectory() as directory:
+            plugin._original_image_dir = Path(directory)
+            event = self.wechat_event()
+            captured = []
+            async def send(chain):
+                captured.append(chain)
+            event.send.side_effect = send
+            self.assertIsNone(asyncio.run(plugin._body(event, "完整报告")))
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][0][0], "file")
+            self.assertEqual(Path(captured[0][0][1]["file"]).read_bytes(), b"png")
+
+    def test_explicit_inline_mode_overrides_wechat_auto(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain", image_send_mode="内嵌图片"))
+        event = self.wechat_event()
+        self.assertEqual(asyncio.run(plugin._body(event, "完整报告")), [("image", b"png")])
+        event.send.assert_not_awaited()
+
+    def test_both_mode_keeps_image_then_file(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain", image_send_mode="两者都发"))
+        with tempfile.TemporaryDirectory() as directory:
+            plugin._original_image_dir = Path(directory)
+            event = self.wechat_event()
+            captured = []
+            async def send(chain):
+                captured.append(chain)
+            event.send.side_effect = send
+            self.assertIsNone(asyncio.run(plugin._body(event, "完整报告")))
+            self.assertEqual(captured[0], [("image", b"png")])
+            self.assertEqual(captured[1][0][0], "file")
+
+    def test_legacy_boolean_still_means_both(self):
+        plugin, _ = self.plugin(dict(send_original_image_file=True))
+        self.assertEqual(plugin._image_send_mode(self.event()), "两者都发")
+        plugin, _ = self.plugin(dict())
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
 
 
 if __name__ == "__main__":
