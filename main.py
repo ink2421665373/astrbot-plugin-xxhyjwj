@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.12")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.13")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -559,9 +559,12 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         return "内嵌图片"
 
     def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:
-        """微信内嵌图会被压到几十 KB：设了高度才切页，默认 0＝保持一张长图。
+        """微信平台按高度切页，默认 1200（守护进程的隐形上限是 1280）。
 
-        只在微信平台生效（QQ 不压这么狠，整张发更省事）；返回 0 表示不切。
+        实测微信守护进程：1080×900 的图原样发出（宽仍是 1080），
+        而 1080×2538 的长图会被压成 545×1280——高度被砍到 1280、宽度同比腰斩，
+        字就出现毛刺。所以默认按 1200 切页，既不触发缩放，条数也不会太多。
+        只在微信平台生效（QQ 整张发更省事）；返回 0 表示不切。
         """
         name = ""
         if event is not None:
@@ -571,11 +574,11 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 name = ""
         if "wechat" not in name:
             return 0
-        raw = self.config.get("image_split_height", 0)
+        raw = self.config.get("image_split_height", 1200)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return 0
+            return 1200
         if value <= 0:
             return 0
         return max(400, min(value, 3000))

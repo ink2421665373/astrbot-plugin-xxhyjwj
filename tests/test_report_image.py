@@ -211,7 +211,7 @@ class ReportImageTests(unittest.TestCase):
     def test_auto_mode_keeps_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
-        self.assertEqual(plugin._image_split_height(self.wechat_event()), 0)
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 1200)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
         event = self.wechat_event()
         result = asyncio.run(plugin._body(event, "完整报告"))
