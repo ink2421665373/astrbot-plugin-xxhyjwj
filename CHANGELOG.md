@@ -1,3 +1,15 @@
+## 1.9.15
+
+### 修复
+
+- 「自动」改成一律发**内嵌图片**：微信里点开就能看到，不再先落一个文件；之前 1.9.14 为了保清晰度把微信默认改成了原图文件，体验上变成"只收到文件"。
+- 微信默认按 `image_split_height=1200` 切页：守护进程会把高度超过 1280 的图缩到 1280（宽度同比腰斩），切成每页 ≤1200 高就能按 1080 原宽发出，字不发毛。
+- 想要像素级无损仍可在插件配置里把「图片发送方式」改成「原图文件」。
+
+### 测试
+
+- `test_auto_mode_sends_inline_image_on_wechat`、`test_explicit_file_mode_still_sends_file_on_wechat`、`test_legacy_boolean_still_means_both` 覆盖三种分流。
+
 ## 1.9.14
 
 ### 修复

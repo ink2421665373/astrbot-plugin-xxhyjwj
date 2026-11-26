@@ -186,7 +186,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.14")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.15")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -547,24 +547,17 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def _image_send_mode(self, event: AstrMessageEvent | None = None) -> str:
         """图片投递方式：自动 / 内嵌图片 / 原图文件 / 两者都发。
 
-        「自动」= 微信发一条原图文件（PNG 原封不动，点开就是原始分辨率），
-        其它平台（QQ 等）发内嵌长图。原因：微信守护进程对所有内嵌图片都会重编码，
-        实测连 540×640 的图都被压成 270×320，报告里的字必然发毛；只有文件通道
-        能保证像素不变。旧配置 ``send_original_image_file`` 为真时按「两者都发」。
+        「自动」= 一律发内嵌图片（微信里点开就能直接看到，不用先存文件）。
+        微信守护进程会对内嵌图重编码、并把高度超过 1280 的图缩到 1280（宽度同比
+        腰斩），所以微信侧配合 ``image_split_height``（默认 1200）切页，保证每页都
+        按原始宽度发出。确实需要像素级无损时，把本项改成「原图文件」即可。
+        旧配置 ``send_original_image_file`` 为真时按「两者都发」。
         """
         raw = str(self.config.get("image_send_mode", "") or "").strip()
         if raw in ("内嵌图片", "原图文件", "两者都发"):
             return raw
         if self.config.get("send_original_image_file", False) is True:
             return "两者都发"
-        name = ""
-        if event is not None:
-            try:
-                name = str(event.get_platform_name() or "").lower()
-            except (AttributeError, TypeError):
-                name = ""
-        if "wechat" in name:
-            return "原图文件"
         return "内嵌图片"
 
     def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:

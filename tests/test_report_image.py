@@ -208,11 +208,20 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(result, [("image", b"png")])
         event.send.assert_not_awaited()
 
-    def test_auto_mode_sends_original_file_on_wechat(self):
+    def test_auto_mode_sends_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
         self.assertEqual(plugin._image_split_height(self.wechat_event()), 1200)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
+        event = self.wechat_event()
+        result = asyncio.run(plugin._body(event, "完整报告"))
+        self.assertEqual(result, [("image", b"png")])
+        event.send.assert_not_awaited()
+
+    def test_explicit_file_mode_still_sends_file_on_wechat(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                     image_send_mode="原图文件"))
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
         with tempfile.TemporaryDirectory() as directory:
             plugin._original_image_dir = Path(directory)
             event = self.wechat_event()
@@ -264,7 +273,7 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(plugin._image_send_mode(self.event()), "两者都发")
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "两者都发")
         plugin, _ = self.plugin(dict())
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
         self.assertEqual(plugin._image_send_mode(self.event()), "内嵌图片")
 
     def test_slice_poster_keeps_every_pixel_and_cuts_on_blank_rows(self):
