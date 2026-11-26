@@ -14,7 +14,13 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image, ImageDraw, ImageFont
 from report_image import FONT_PATH, WIDTH, _blocks, _wrap, render_report_images
-from delivery import slice_poster, split_message, save_originals
+from delivery import (
+    WECHAT_IMAGE_BUDGET_BYTES,
+    encode_jpeg_within_budget,
+    save_originals,
+    slice_poster,
+    split_message,
+)
 
 
 class ReportImageTests(unittest.TestCase):
@@ -81,14 +87,16 @@ class ReportImageTests(unittest.TestCase):
     def plugin(self, config):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
         source = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_body" for f in n.body))
-        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_split_height", "_image_pages")]
+        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_split_height", "_image_pages", "_image_budget")]
         cls = ast.ClassDef(name="Plugin", bases=[], keywords=[], body=methods, decorator_list=[])
         components = SimpleNamespace(Reply=lambda **kw: ("reply", kw), Plain=lambda text: ("plain", text),
                                      Image=SimpleNamespace(fromBytes=lambda image: ("image", image)),
                                      File=lambda **kwargs: ("file", kwargs))
         env = dict(asyncio=asyncio, base64=base64, AstrMessageEvent=object, Comp=components,
                    render_report_images=lambda text: [b"png"], logger=logging.getLogger(__name__),
-                   split_message=split_message, save_originals=save_originals, slice_poster=slice_poster)
+                   split_message=split_message, save_originals=save_originals, slice_poster=slice_poster,
+                   encode_jpeg_within_budget=encode_jpeg_within_budget,
+                   WECHAT_IMAGE_BUDGET_BYTES=WECHAT_IMAGE_BUDGET_BYTES)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
         plugin = env["Plugin"]()
         plugin.config = config
@@ -211,7 +219,7 @@ class ReportImageTests(unittest.TestCase):
     def test_auto_mode_sends_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
-        self.assertEqual(plugin._image_split_height(self.wechat_event()), 1200)
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
         event = self.wechat_event()
         result = asyncio.run(plugin._body(event, "完整报告"))
@@ -275,6 +283,44 @@ class ReportImageTests(unittest.TestCase):
         plugin, _ = self.plugin(dict())
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
         self.assertEqual(plugin._image_send_mode(self.event()), "内嵌图片")
+
+    def test_wechat_pages_are_jpeg_within_daemon_budget(self):
+        """守护进程只原样转发 ≤65,520 字节的 JPEG，超了就缩图降质。"""
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                       image_send_mode="内嵌图片"))
+        tall = Image.new("RGB", (1080, 2400), "#ffffff")
+        draw = ImageDraw.Draw(tall)
+        for y in range(40, 2400, 60):
+            draw.rectangle((60, y, 1020, y + 28), fill="#1b2a4a")
+        buffer = BytesIO()
+        tall.save(buffer, format="PNG")
+        env["render_report_images"] = lambda text: [buffer.getvalue()]
+        result = asyncio.run(plugin._body(self.wechat_event(), "完整报告"))
+        self.assertGreaterEqual(len(result), 3)
+        budget = env["WECHAT_IMAGE_BUDGET_BYTES"]
+        for _, page in result:
+            self.assertLessEqual(len(page), budget)
+            self.assertTrue(page.startswith(b"\xff\xd8"), "微信页必须是 JPEG")
+            with Image.open(BytesIO(page)) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.width, 1080)
+        qq = asyncio.run(plugin._body(self.event(), "完整报告"))
+        self.assertEqual(len(qq), 1)
+        self.assertTrue(qq[0][1].startswith(b"\x89PNG"), "QQ 仍发原始 PNG")
+
+    def test_jpeg_budget_encoder_shrinks_but_keeps_full_width(self):
+        canvas = Image.new("RGB", (1080, 700), "#ffffff")
+        ImageDraw.Draw(canvas).rectangle((40, 40, 1040, 120), fill="#123456")
+        buffer = BytesIO()
+        canvas.save(buffer, format="PNG")
+        data = encode_jpeg_within_budget(buffer.getvalue(), 30000)
+        self.assertIsNotNone(data)
+        self.assertLessEqual(len(data), 30000)
+        with Image.open(BytesIO(data)) as image:
+            self.assertEqual(image.format, "JPEG")
+            self.assertLessEqual(image.width, 1080)
+        self.assertIsNone(encode_jpeg_within_budget(b"not an image", 30000))
+        self.assertIsNone(encode_jpeg_within_budget(buffer.getvalue(), 0))
 
     def test_slice_poster_keeps_every_pixel_and_cuts_on_blank_rows(self):
         canvas = Image.new("RGB", (200, 1000), "#f2efe7")

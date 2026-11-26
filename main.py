@@ -31,7 +31,14 @@ import astrbot.api.message_components as Comp
 
 from .binding import BindingManager
 from .ai_analysis import AIAnalysisMixin, build_analysis_data
-from .delivery import QueryProgress, save_originals, slice_poster, split_message
+from .delivery import (
+    WECHAT_IMAGE_BUDGET_BYTES,
+    QueryProgress,
+    encode_jpeg_within_budget,
+    save_originals,
+    slice_poster,
+    split_message,
+)
 from .auth_state import read_saved_auth
 from .mapping_config import ensure_template_keys, merge_season_options, nickname_lookup
 from .mapping_views import MappingViewMixin
@@ -186,7 +193,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.15")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.16")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -561,12 +568,12 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         return "内嵌图片"
 
     def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:
-        """微信平台按高度切页，默认 1200（守护进程的隐形上限是 1280）。
+        """微信平台按高度切页，默认 900。
 
-        实测微信守护进程：1080×900 的图原样发出（宽仍是 1080），
-        而 1080×2538 的长图会被压成 545×1280——高度被砍到 1280、宽度同比腰斩，
-        字就出现毛刺。所以默认按 1200 切页，既不触发缩放，条数也不会太多。
-        只在微信平台生效（QQ 整张发更省事）；返回 0 表示不切。
+        守护进程只原样保留「JPEG ≤ 65,520 字节」的图；一旦超过就重编码，
+        并把最长边压到 1280、必要时继续降质量——所以长图在微信里必然糊。
+        按 900 切页后每页都能压进预算（实测 1080×700 用 q95 才 43KB），
+        守护进程会逐字节原样转发。只在微信生效；返回 0 表示不切。
         """
         name = ""
         if event is not None:
@@ -576,17 +583,28 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 name = ""
         if "wechat" not in name:
             return 0
-        raw = self.config.get("image_split_height", 1200)
+        raw = self.config.get("image_split_height", 900)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return 1200
+            return 900
         if value <= 0:
             return 0
         return max(400, min(value, 3000))
 
+    def _image_budget(self) -> int:
+        """微信单张图的字节预算：守护进程原样转发 JPEG 的上限，默认 65,200。"""
+        raw = self.config.get("image_wechat_budget", WECHAT_IMAGE_BUDGET_BYTES)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return WECHAT_IMAGE_BUDGET_BYTES
+        if value <= 0:
+            return 0
+        return max(20000, min(value, 5_000_000))
+
     def _image_pages(self, event: AstrMessageEvent | None, images: list[bytes]) -> list[bytes]:
-        """按平台把长图切成多页；切不开或不需要时原样返回。"""
+        """把长图切成多页，微信再压进守护进程的「原样转发」预算（JPEG）。"""
         height = self._image_split_height(event)
         if height <= 0:
             return images
@@ -596,7 +614,17 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                 pages.extend(slice_poster(image, height))
             except (OSError, ValueError):
                 pages.append(image)
-        return pages or images
+        budget = self._image_budget()
+        if budget <= 0:
+            return pages or images
+        packed: list[bytes] = []
+        for page in pages:
+            try:
+                jpeg = encode_jpeg_within_budget(page, budget)
+            except (OSError, ValueError):
+                jpeg = None
+            packed.append(jpeg or page)
+        return packed or images
 
     async def _body(self, event: AstrMessageEvent, message: str, first: bool = False, progress=None):
         """战绩正文；first=False 时不 @（at 只加在第一条分条上）。"""

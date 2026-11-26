@@ -1,3 +1,17 @@
+## 1.9.16
+
+### 优化
+
+- 微信内嵌图改成「先压进守护进程的原样转发预算」：守护进程只对 **JPEG 且 ≤ 65,520 字节**的源图
+  `sourcePreserved=true`（实测 sha256 与原图一致），超过就重编码、把最长边压到 1280、必要时继续降质量。
+  插件现在按 900 高度切页，并把每页编码成 ≤ 65,200 字节的 JPEG 再发，微信收到的是我们渲染的同一份字节。
+- 新增配置 `image_wechat_budget`（默认 65200）：微信单张图的字节预算，一般不用改。
+
+### 测试
+
+- `test_wechat_pages_are_jpeg_within_daemon_budget`：微信页必须是 JPEG 且 ≤ 预算、宽度仍是 1080；QQ 仍发原始 PNG。
+- `test_jpeg_budget_encoder_shrinks_but_keeps_full_width`：预算编码器能压缩、能兜底（非图片/预算为 0 返回 None）。
+
 ## 1.9.15
 
 ### 修复

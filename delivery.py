@@ -112,6 +112,49 @@ def slice_poster(image: bytes, max_height: int, *, min_height_ratio: float = 0.7
         return out
 
 
+# 微信守护进程只原样保留「JPEG 且不超过 65,520 字节」的源图（实测 sourcePreserved=true、
+# sha256 与源一致）；超过就重编码，并把最长边压到 1280、必要时继续降质量凑到预算内。
+# 所以想让微信原样转发，就得自己先压进这个预算。
+WECHAT_IMAGE_BUDGET_BYTES = 65200
+
+
+def encode_jpeg_within_budget(image: bytes, max_bytes: int = WECHAT_IMAGE_BUDGET_BYTES,
+                              *, min_quality: int = 45) -> bytes | None:
+    """把一张图编码成不超过 max_bytes 的 JPEG；同尺寸压不进预算时等比缩小重试。
+
+    宁可小幅缩图也不把质量压到 45 以下（低质量 JPEG 在中文细笔画上会出方块）；
+    实在压不进就继续缩小，直到 0.4 倍仍不行则返回 None 交给调用方兜底。
+    """
+    from PIL import Image
+
+    if max_bytes <= 0:
+        return None
+    try:
+        with Image.open(io.BytesIO(image)) as source:
+            canvas = source.convert("RGB")
+    except (OSError, ValueError):
+        return None
+    scale = 1.0
+    while True:
+        target = canvas
+        if scale < 1.0:
+            size = (max(1, int(canvas.width * scale)), max(1, int(canvas.height * scale)))
+            target = canvas.resize(size, Image.LANCZOS)
+        quality = 95
+        while True:
+            buffer = io.BytesIO()
+            target.save(buffer, format="JPEG", quality=quality, optimize=True)
+            data = buffer.getvalue()
+            if len(data) <= max_bytes:
+                return data
+            if quality <= min_quality:
+                break
+            quality = max(min_quality, quality - 5)
+        if scale <= 0.4:
+            return None
+        scale *= 0.85
+
+
 def save_originals(directory, images, *, now=None):
     """Keep sent originals for callback downloads; expire only our own old PNGs."""
     directory = Path(directory)
