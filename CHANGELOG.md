@@ -1,3 +1,11 @@
+## 1.9.14
+
+### 修复
+- 微信「一张图但被压糊」：实测守护进程对所有内嵌图都会重编码（`imagePreparation.sourcePreserved` 恒为 `false`，540×640 也被压成 270×320，`standardSourceId` 返回 `unsupported`），单张内嵌图无法既不缩小又清晰。`image_send_mode` 的「自动」改为：微信发**一条原图文件**（PNG 原封不动），QQ 等平台仍发内嵌长图。
+
+### 测试
+- `test_auto_mode_sends_original_file_on_wechat`、`test_wechat_inline_mode_still_splits`、`test_legacy_boolean_still_means_both` 覆盖自动/显式/旧开关三种分流。
+
 ﻿# 更新日志
 
 ## 1.9.13

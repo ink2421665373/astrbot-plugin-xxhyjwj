@@ -208,18 +208,23 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(result, [("image", b"png")])
         event.send.assert_not_awaited()
 
-    def test_auto_mode_keeps_inline_image_on_wechat(self):
+    def test_auto_mode_sends_original_file_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
         self.assertEqual(plugin._image_split_height(self.wechat_event()), 1200)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
-        event = self.wechat_event()
-        result = asyncio.run(plugin._body(event, "完整报告"))
-        self.assertEqual(result, [("image", b"png")])
-        event.send.assert_not_awaited()
+        with tempfile.TemporaryDirectory() as directory:
+            plugin._original_image_dir = Path(directory)
+            event = self.wechat_event()
+            result = asyncio.run(plugin._body(event, "完整报告"))
+            self.assertIsNone(result)
+            sent = [call.args[0] for call in event.send.await_args_list]
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0][0], "file")
 
-    def test_wechat_long_poster_is_split_into_pages(self):
-        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain", image_split_height=900))
+    def test_wechat_inline_mode_still_splits(self):
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                       image_split_height=900, image_send_mode="内嵌图片"))
         self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
         tall = Image.new("RGB", (1080, 2400), "#f2efe7")
         ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
@@ -257,8 +262,10 @@ class ReportImageTests(unittest.TestCase):
     def test_legacy_boolean_still_means_both(self):
         plugin, _ = self.plugin(dict(send_original_image_file=True))
         self.assertEqual(plugin._image_send_mode(self.event()), "两者都发")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "两者都发")
         plugin, _ = self.plugin(dict())
-        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
+        self.assertEqual(plugin._image_send_mode(self.wechat_event()), "原图文件")
+        self.assertEqual(plugin._image_send_mode(self.event()), "内嵌图片")
 
     def test_slice_poster_keeps_every_pixel_and_cuts_on_blank_rows(self):
         canvas = Image.new("RGB", (200, 1000), "#f2efe7")
