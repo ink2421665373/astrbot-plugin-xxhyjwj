@@ -1,4 +1,4 @@
-﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -41,7 +41,13 @@ from .delivery import (
     split_message,
 )
 from .auth_state import read_saved_auth
-from .mapping_config import ensure_template_keys, merge_season_options, nickname_key, nickname_lookup
+from .mapping_config import (
+    NICKNAME_TEMPLATE_KEY,
+    ensure_template_keys,
+    merge_season_options,
+    nickname_key,
+    nickname_lookup,
+)
 from .mapping_views import MappingViewMixin
 from .report_image import render_report_images
 from .heybox_api import (
@@ -195,7 +201,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.19")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.20")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -380,6 +386,56 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             return False
         logger.info(f"[naraka] 已重新绑定 nickname={nickname!r} role_id={role_id}")
         return True
+
+    def _nickname_register_enabled(self) -> bool:
+        """是否把查询到的新昵称自动登记进映射（默认开）。"""
+        raw = self.config.get("nickname_auto_register", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("", "0", "false", "no", "off")
+        return raw is not False
+
+    def _append_mapping_row(self, nickname: str, role_id: str) -> bool:
+        """往映射里追加一行（同一个 role_id 可以有多个别名）。"""
+        nick = str(nickname or "").strip()
+        rid = str(role_id or "").strip()
+        if not nick or not rid:
+            return False
+        if nickname_lookup(self.config, nick) is not None:
+            return False
+        rows = list(self.config.get("nickname_mappings", []) or [])
+        rows.append({"__template_key": NICKNAME_TEMPLATE_KEY, "nickname": nick, "role_id": rid})
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            save({"nickname_mappings": rows})
+        else:
+            self.config["nickname_mappings"] = rows
+        logger.info(f"[naraka] 已登记昵称 nickname={nick!r} role_id={rid}")
+        return True
+
+    def _remember_nickname(self, name: str, row: dict) -> None:
+        """搜索命中的新昵称自动入库，避免下次改名后又搜不到。"""
+        if not self._nickname_register_enabled():
+            return
+        try:
+            self._append_mapping_row(name, str((row or {}).get("role_id") or ""))
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.info(f"[naraka] 登记昵称失败 nickname={name!r}: {type(exc).__name__}")
+
+    def _sync_role_alias(self, role_id: str, role_name: str) -> None:
+        """上游角色名又变了：把新名字登记成同一 role_id 的别名。"""
+        if not self._nickname_register_enabled():
+            return
+        name = str(role_name or "").strip()
+        rid = str(role_id or "").strip()
+        if not name or not rid:
+            return
+        known = {nickname_key(alias) for alias in self._mapping_aliases(rid)}
+        if nickname_key(name) in known:
+            return
+        try:
+            self._append_mapping_row(name, rid)
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.info(f"[naraka] 登记角色新名失败 name={name!r}: {type(exc).__name__}")
 
     async def _role_newest_ms(self, session, role_id: str, server: str) -> float | None:
         """取某个角色最近几场的最大时间戳（毫秒），失败返回 None。"""
@@ -1443,6 +1499,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
 
         row, ambiguous = pick(public_rows)
         if row is not None:
+            self._remember_nickname(name, row)
             return row, ""
 
         if self.logged_in:
@@ -1464,6 +1521,7 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                     )
                     row, ambiguous = pick(found)
                     if row is not None:
+                        self._remember_nickname(name, row)
                         return row, ""
                     return None, "未找到唯一玩家，请先用 永劫搜索 昵称 核对是哪位玩家。"
 
@@ -1558,6 +1616,10 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
 
                     phase = "home"
                     home = await self._home_data(session, common, mode_id, list_season)
+                    if selected.get("from_mapping"):
+                        upstream = str((home.get("player_info") or {}).get("name") or "")
+                        if upstream:
+                            self._sync_role_alias(role_id, upstream)
                     if configured_season and str(home.get("battle_tid") or mode_id) != mode_id:
                         raise ValueError("接口返回模式与所选模式不一致，未展示赛季数据")
                 except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:

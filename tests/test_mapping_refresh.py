@@ -1,4 +1,4 @@
-"""改名校验：映射命中的角色数据过旧时，用当前角色名重新绑定刷新一次。"""
+﻿"""改名校验：映射命中的角色数据过旧时，用当前角色名重新绑定刷新一次。"""
 import ast
 import asyncio
 from contextlib import asynccontextmanager
@@ -27,6 +27,9 @@ def build_view(names, **config):
     env = dict(asynccontextmanager=asynccontextmanager, asyncio=asyncio, time=time, logger=Mock(),
                newest_match_ms=record_query.newest_match_ms,
                nickname_key=mapping_config.nickname_key,
+               nickname_lookup=mapping_config.nickname_lookup,
+               flatten_nickname_groups=mapping_config.flatten_nickname_groups,
+               NICKNAME_TEMPLATE_KEY=mapping_config.NICKNAME_TEMPLATE_KEY,
                HeyboxError=record_query.__dict__.get("HeyboxError", Exception),
                aiohttp=type("aiohttp", (), {"ClientError": Exception}))
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
@@ -279,6 +282,49 @@ class SwitchRoleTests(unittest.TestCase):
             newest={"old": 9999.0},
         )
         self.assertIsNone(self.run_async(view._maybe_switch_role(None, "old", "lzn", "163", 1000.0)))
+
+
+class NicknameRegisterTests(unittest.TestCase):
+    def make(self, **config):
+        names = {"_remember_nickname", "_sync_role_alias", "_append_mapping_row",
+                 "_nickname_register_enabled", "_mapping_aliases"}
+        config.setdefault("nickname_mappings", [
+            {"__template_key": "nickname", "nickname": "旧名", "role_id": "abc"},
+        ])
+        view = build_view(names, **config)
+        view.config = FakeConfig(view.config)
+        return view
+
+    def rows(self, view):
+        return [(r.get("nickname"), r.get("role_id")) for r in view.config["nickname_mappings"]]
+
+    def test_remember_new_nickname_writes_template_row(self):
+        view = self.make()
+        view._remember_nickname("新名", {"role_id": "zzz"})
+        self.assertIn(("新名", "zzz"), self.rows(view))
+        added = view.config["nickname_mappings"][-1]
+        self.assertEqual(added["__template_key"], "nickname")
+        self.assertIn("nickname_mappings", view.config.saved)
+
+    def test_remember_skips_known_nickname(self):
+        view = self.make()
+        view._remember_nickname("旧名", {"role_id": "abc"})
+        self.assertEqual(len(view.config["nickname_mappings"]), 1)
+
+    def test_register_can_be_disabled(self):
+        view = self.make(nickname_auto_register="false")
+        view._remember_nickname("新名", {"role_id": "zzz"})
+        self.assertEqual(len(view.config["nickname_mappings"]), 1)
+
+    def test_sync_alias_adds_renamed_role_name(self):
+        view = self.make()
+        view._sync_role_alias("abc", "又改了")
+        self.assertIn(("又改了", "abc"), self.rows(view))
+
+    def test_sync_alias_is_noop_for_known_name(self):
+        view = self.make()
+        view._sync_role_alias("abc", "旧名")
+        self.assertEqual(len(view.config["nickname_mappings"]), 1)
 
 
 if __name__ == "__main__":
