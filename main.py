@@ -62,6 +62,7 @@ from .record_query import (
     format_summary,
     make_record,
     match_mode_counts,
+    newest_match_ms,
     normalize_rank_data,
     recent_rows,
     resolve_mode,
@@ -194,7 +195,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.17")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.18")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -306,6 +307,91 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
 
     def _auto_bind(self) -> bool:
         return bool(self.config.get("auto_bind", True)) and self.data_mode in LOGIN_MODES
+
+    def _mapping_stale_days(self) -> float:
+        """昵称映射命中的角色，数据旧到这个天数就重新绑定刷新一次（0 = 关闭）。"""
+        return self._number_setting("mapping_stale_days", 3.0, 0.0, 365.0)
+
+    @staticmethod
+    def _rows_stale(rows: list[dict], days: float) -> bool:
+        """对局列表里最新一场已经超过 days 天（取不到时间也算旧）。"""
+        if days <= 0:
+            return False
+        newest = newest_match_ms(rows)
+        if newest is None:
+            return True
+        return (time.time() - newest / 1000.0) > days * 86400.0
+
+    def _mapping_aliases(self, role_id: str) -> list[str]:
+        """同一个角色在映射里登记过的所有昵称（改名前后都算）。"""
+        target = str(role_id or "").strip()
+        if not target:
+            return []
+        names: list[str] = []
+        for row in self.config.get("nickname_mappings", []) or []:
+            if not isinstance(row, dict) or str(row.get("role_id") or "") != target:
+                continue
+            nickname = str(row.get("nickname") or "").strip()
+            if nickname and nickname not in names:
+                names.append(nickname)
+        return names
+
+    async def _rebind_after_already_bound(self, session, nickname: str, role_id: str, server: str) -> bool:
+        """「你已经绑定过游戏账号了」时，先解绑这个角色登记过的旧昵称再绑当前名。"""
+        api = getattr(self, "_api", None)
+        if api is None:
+            return False
+        released = False
+        for alias in self._mapping_aliases(role_id):
+            if alias == nickname:
+                continue
+            try:
+                await api.unbind_game(session, alias, server)
+                released = True
+                logger.info(f"[naraka] 已尝试解绑旧昵称绑定 alias={alias!r} role_id={role_id}")
+            except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                logger.info(f"[naraka] 解绑旧昵称失败 alias={alias!r}: {type(exc).__name__}")
+        if not released:
+            return False
+        try:
+            async with self._binding.bound(session, nickname, server, role_id=role_id) as outcome:
+                return bool(outcome.ok)
+        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return False
+
+    async def _refresh_mapping_data(self, session, nickname: str, role_id: str, server: str) -> bool:
+        """映射命中的角色数据过旧：用当前角色名重新绑定一次，逼上游补数据。
+
+        小黑盒的对局刷新依赖「账号 ↔ 角色」绑定，而绑定是按昵称发起的；角色改名后
+        旧昵称绑不上，数据就会一直停在改名那一刻。这里用映射里保存的当前角色名补
+        一次绑定，让上游把改名之后的对局补进来。
+        """
+        if not self._auto_bind():
+            return False
+        name = str(nickname or "").strip()
+        if not name:
+            return False
+        try:
+            async with self._binding.bound(session, name, server, role_id=role_id) as outcome:
+                if not outcome.ok:
+                    logger.info(
+                        f"[naraka] 映射刷新绑定失败 nickname={name!r} "
+                        f"state={outcome.state} reason={outcome.message}"
+                    )
+                    if "已经绑定" not in str(outcome.message or ""):
+                        return False
+                    if not await self._rebind_after_already_bound(session, name, role_id, server):
+                        return False
+                try:
+                    await self._refresh(session, role_id, server)
+                except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    logger.warning(f"[naraka] 映射刷新 update 失败 name={name!r}: {type(exc).__name__}")
+                await asyncio.sleep(2)
+        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning(f"[naraka] 映射刷新失败 name={name!r}: {type(exc).__name__}")
+            return False
+        logger.info(f"[naraka] 昵称映射数据过旧，已重新绑定刷新 name={name!r} role_id={role_id}")
+        return True
 
     def _detail_query_mode(self) -> str:
         """兼容旧版布尔开关及新版三档配置。"""
@@ -1332,11 +1418,17 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             # Decide the effective scope before requesting details. If its list
             # or primary overview fails, discard that scope and retry all-season
             # inputs once, so a report cannot mix two seasons.
+            mapping_refreshed = False
             for attempt in range(2):
                 phase = "list"
                 home = None
                 try:
                     rows = await self._fetch_recent_pool(session, common, query_limit, battle_tid=requested_mode, season=list_season)
+                    if (selected.get("from_mapping") and not mapping_refreshed
+                            and self._rows_stale(rows, self._mapping_stale_days())):
+                        mapping_refreshed = True
+                        if await self._refresh_mapping_data(session, name, role_id, server):
+                            rows = await self._fetch_recent_pool(session, common, query_limit, battle_tid=requested_mode, season=list_season)
                     pool_modes = match_mode_counts(rows)
                     if not rows and detailed:
                         return _ReadResult(ok=False, role_id=role_id, server=server, nickname=name,

@@ -238,6 +238,18 @@ def _timestamp_ms(value: object) -> float | None:
     return milliseconds if 2000 <= stamp.year <= 2100 else None
 
 
+def newest_match_ms(rows: list[dict]) -> float | None:
+    """对局列表里最新一场的时间戳（毫秒）；没有可解析时间就返回 None。"""
+    stamps = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        stamp = _timestamp_ms(row.get("time"))
+        if stamp:
+            stamps.append(stamp)
+    return max(stamps) if stamps else None
+
+
 def format_query_metadata(queried_at: float | None = None) -> list[str]:
     stamp = datetime.now(BEIJING) if queried_at is None else datetime.fromtimestamp(queried_at, BEIJING)
     return [f"查询时间（北京时间）：{stamp:%Y-%m-%d %H:%M:%S}",
