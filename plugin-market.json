@@ -2,14 +2,14 @@
   "$meta": {
     "schema_version": 1,
     "name": "永劫无间战绩查询插件源",
-    "version": "1.9.18",
+    "version": "1.9.19",
     "homepage": "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj",
     "repository": "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj"
   },
   "astrbot_plugin_naraka": {
     "author": "as124da1231",
     "name": "astrbot_plugin_naraka",
-    "version": "1.9.18",
+    "version": "1.9.19",
     "repo": "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj",
     "desc": "通过小黑盒查询永劫无间端游近期战绩与单局详情，支持昵称搜索、模式筛选、三种数据模式、自动绑定兜底与可选AI战绩评价。",
     "display_name": "永劫无间战绩查询",

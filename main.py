@@ -1,4 +1,4 @@
-"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
+﻿"""QQ commands for looking up NARAKA PC records through Xiaoheihe.
 
 数据模式（配置项 ``data_mode``）：
 
@@ -41,7 +41,7 @@ from .delivery import (
     split_message,
 )
 from .auth_state import read_saved_auth
-from .mapping_config import ensure_template_keys, merge_season_options, nickname_lookup
+from .mapping_config import ensure_template_keys, merge_season_options, nickname_key, nickname_lookup
 from .mapping_views import MappingViewMixin
 from .report_image import render_report_images
 from .heybox_api import (
@@ -195,7 +195,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.18")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.19")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -337,27 +337,128 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         return names
 
     async def _rebind_after_already_bound(self, session, nickname: str, role_id: str, server: str) -> bool:
-        """「你已经绑定过游戏账号了」时，先解绑这个角色登记过的旧昵称再绑当前名。"""
+        """「你已经绑定过游戏账号了」时，先解绑旧昵称、等一会儿再绑当前名。
+
+        小黑盒的绑定槽一次只放一个角色，而且解绑有延迟：刚解完立刻绑会继续报
+        「已经绑定过」；实测先等 3 秒、绑定拿到 waiting 后每 3 秒轮询一次，
+        通常第二次就能拿到 ok。
+        """
         api = getattr(self, "_api", None)
         if api is None:
             return False
         released = False
-        for alias in self._mapping_aliases(role_id):
-            if alias == nickname:
-                continue
+        targets = [nickname] + [alias for alias in self._mapping_aliases(role_id) if alias != nickname]
+        for alias in targets:
             try:
-                await api.unbind_game(session, alias, server)
+                async with self._paced():
+                    await api.unbind_game(session, alias, server)
                 released = True
-                logger.info(f"[naraka] 已尝试解绑旧昵称绑定 alias={alias!r} role_id={role_id}")
+                logger.info(f"[naraka] 已解绑旧昵称绑定 alias={alias!r} role_id={role_id}")
             except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 logger.info(f"[naraka] 解绑旧昵称失败 alias={alias!r}: {type(exc).__name__}")
         if not released:
             return False
+        await asyncio.sleep(3)
         try:
-            async with self._binding.bound(session, nickname, server, role_id=role_id) as outcome:
-                return bool(outcome.ok)
-        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            async with self._paced():
+                body = await api.bind_game(session, nickname, server)
+            state = str(body.get("state") or "")
+            for _ in range(6):
+                if state == "ok":
+                    break
+                if state not in ("waiting", ""):
+                    break
+                await asyncio.sleep(3)
+                async with self._paced():
+                    body = await api.bind_game_state(session, nickname)
+                state = str(body.get("state") or "")
+        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.info(f"[naraka] 重绑失败 nickname={nickname!r}: {type(exc).__name__}")
             return False
+        if state != "ok":
+            logger.info(f"[naraka] 重绑未成功 nickname={nickname!r} state={state}")
+            return False
+        logger.info(f"[naraka] 已重新绑定 nickname={nickname!r} role_id={role_id}")
+        return True
+
+    async def _role_newest_ms(self, session, role_id: str, server: str) -> float | None:
+        """取某个角色最近几场的最大时间戳（毫秒），失败返回 None。"""
+        try:
+            async with self._paced():
+                body = await self._api.match_list(
+                    session, role_id, server=server, page=1, page_size=5, limit=5, offset=0,
+                    battle_tid="", season="", heybox_id=str(self._auth.get("uid") or ""),
+                )
+        except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+        matches = body.get("data") if isinstance(body.get("data"), list) else (body.get("match_list") or [])
+        rows = [row for row in matches if isinstance(row, dict)]
+        return newest_match_ms(rows)
+
+    def _retarget_mapping(self, old_role_id: str, new_role_id: str) -> bool:
+        """把映射里属于旧角色的行改成新角色（改名后 role_id 变了的情况）。"""
+        old = str(old_role_id or "").strip()
+        new = str(new_role_id or "").strip()
+        if not old or not new or old == new:
+            return False
+        rows: list[dict] = []
+        changed = 0
+        for row in self.config.get("nickname_mappings", []) or []:
+            if isinstance(row, dict) and str(row.get("role_id") or "") == old:
+                row = dict(row, role_id=new)
+                changed += 1
+            rows.append(row)
+        if not changed:
+            return False
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            save({"nickname_mappings": rows})
+        else:
+            self.config["nickname_mappings"] = rows
+        return True
+
+    async def _maybe_switch_role(self, session, role_id: str, name: str, server: str,
+                                 current_newest: float | None) -> dict | None:
+        """映射角色的数据不新鲜时，用别名重新搜一遍，换到更新过的同名角色。
+
+        角色改名后，小黑盒有可能给新名字分配了另一个角色唯一标识：此时旧 role_id 的
+        数据会永远停住，而新 role_id 才有改名之后的对局。这里用映射里登记过的每个别名
+        重新免登录搜索，对候选角色各取一次最近对局，谁更新就用谁，并把映射改过去。
+        """
+        aliases = self._mapping_aliases(role_id) or [str(name or "").strip()]
+        aliases = [item for item in aliases if item][:3]
+        if not aliases:
+            return None
+        seen = {str(role_id)}
+        best_row: dict | None = None
+        best_newest = float(current_newest or 0.0)
+        for alias in aliases:
+            try:
+                candidates = await self._public_search_rows(session, alias, limit=10)
+            except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                continue
+            for row in candidates:
+                if not isinstance(row, dict):
+                    continue
+                cand = str(row.get("role_id") or "").strip()
+                if not cand or cand in seen:
+                    continue
+                seen.add(cand)
+                if nickname_key(str(row.get("role_name") or "")) != nickname_key(alias):
+                    continue
+                newest = await self._role_newest_ms(session, cand, server)
+                if newest and newest > best_newest:
+                    best_row, best_newest = row, newest
+        if best_row is None:
+            return None
+        new_id = str(best_row.get("role_id") or "").strip()
+        if not self._retarget_mapping(role_id, new_id):
+            return None
+        logger.info(
+            f"[naraka] 改名后换到新角色 role_id={new_id} "
+            f"name={best_row.get('role_name')!r} 旧 role_id={role_id}"
+        )
+        return best_row
 
     async def _refresh_mapping_data(self, session, nickname: str, role_id: str, server: str) -> bool:
         """映射命中的角色数据过旧：用当前角色名重新绑定一次，逼上游补数据。
@@ -1429,6 +1530,15 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                         mapping_refreshed = True
                         if await self._refresh_mapping_data(session, name, role_id, server):
                             rows = await self._fetch_recent_pool(session, common, query_limit, battle_tid=requested_mode, season=list_season)
+                        if self._rows_stale(rows, self._mapping_stale_days()):
+                            switched = await self._maybe_switch_role(
+                                session, role_id, name, server, newest_match_ms(rows)
+                            )
+                            if switched:
+                                role_id = str(switched.get("role_id") or role_id)
+                                name = str(switched.get("role_name") or name)
+                                common["role_id"] = role_id
+                                rows = await self._fetch_recent_pool(session, common, query_limit, battle_tid=requested_mode, season=list_season)
                     pool_modes = match_mode_counts(rows)
                     if not rows and detailed:
                         return _ReadResult(ok=False, role_id=role_id, server=server, nickname=name,

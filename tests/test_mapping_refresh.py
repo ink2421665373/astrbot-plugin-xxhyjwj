@@ -16,6 +16,7 @@ package = ModuleType("naraka_test_package")
 package.__path__ = [str(ROOT)]
 sys.modules.setdefault("naraka_test_package", package)
 record_query = importlib.import_module("naraka_test_package.record_query")
+mapping_config = importlib.import_module("naraka_test_package.mapping_config")
 
 
 def build_view(names, **config):
@@ -25,6 +26,7 @@ def build_view(names, **config):
                        body=[node for node in cls.body if getattr(node, "name", "") in names])
     env = dict(asynccontextmanager=asynccontextmanager, asyncio=asyncio, time=time, logger=Mock(),
                newest_match_ms=record_query.newest_match_ms,
+               nickname_key=mapping_config.nickname_key,
                HeyboxError=record_query.__dict__.get("HeyboxError", Exception),
                aiohttp=type("aiohttp", (), {"ClientError": Exception}))
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
@@ -106,12 +108,33 @@ class MappingRefreshTests(unittest.TestCase):
         view.unbound = []
         view._auto_bind = lambda: True  # type: ignore[assignment]
 
+        @asynccontextmanager
+        async def paced(**kwargs):
+            yield
+
+        view._paced = paced
+
         class FakeApi:
+            unbind_ok = True
+            binds = ("waiting", "ok")
+
             async def unbind_game(self, session, game_id, server_id=None):
                 view.unbound.append(game_id)
-                return {"state": "ok"}
+                if not self.unbind_ok:
+                    raise RuntimeError("unbind failed")
+                return {}
+
+            async def bind_game(self, session, game_id, server_id=None):
+                view.bind_calls.append(game_id)
+                return {"state": self.binds[0]}
+
+            async def bind_game_state(self, session, game_id):
+                if len(self.binds) > 1:
+                    return {"state": self.binds[1]}
+                return {"state": self.binds[0]}
 
         view._api = FakeApi()
+        view.bind_calls = []
 
         async def fake_refresh(session, role_id, server):
             view.refreshed.append((role_id, server))
@@ -159,19 +182,103 @@ class MappingRefreshTests(unittest.TestCase):
         self.assertEqual(view._mapping_aliases("missing"), [])
 
     def test_already_bound_falls_back_to_unbind_then_rebind(self):
-        view = self.make(sequence=[Outcome(ok=False, state="error", message="你已经绑定过游戏账号了"), Outcome()])
+        view = self.make(sequence=[Outcome(ok=False, state="error", message="你已经绑定过游戏账号了")])
         ok = self.run_async(view._refresh_mapping_data(None, "睡不醒的某阳", "95bs", "cn"))
         self.assertTrue(ok)
-        self.assertEqual(view.unbound, ["lzn", "李知恩"])
-        self.assertEqual([c[0] for c in view._binding.calls], ["睡不醒的某阳", "睡不醒的某阳"])
+        self.assertEqual(view.unbound, ["睡不醒的某阳", "lzn", "李知恩"])
+        self.assertEqual(view.bind_calls, ["睡不醒的某阳"])
         self.assertEqual(view.refreshed, [("95bs", "cn")])
 
-    def test_already_bound_without_other_alias_gives_up(self):
+    def test_unbind_failure_gives_up(self):
         view = self.make(sequence=[Outcome(ok=False, state="error", message="你已经绑定过游戏账号了")])
+        view._api.unbind_ok = False
         ok = self.run_async(view._refresh_mapping_data(None, "君墨", "slil", "cn"))
         self.assertFalse(ok)
-        self.assertEqual(view.unbound, [])
+        self.assertEqual(view.bind_calls, [])
         self.assertEqual(view.refreshed, [])
+
+
+class FakeConfig(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.saved = None
+
+    def save_config(self, patch=None):
+        self.saved = dict(patch or {})
+        if patch:
+            self.update(patch)
+
+
+class SwitchRoleTests(unittest.TestCase):
+    def make(self, candidates=None, newest=None):
+        view = build_view({"_maybe_switch_role", "_retarget_mapping", "_mapping_aliases"})
+        view.config = FakeConfig({
+            "nickname_mappings": [
+                {"nickname": "lzn", "role_id": "old"},
+                {"nickname": "睡不醒的某阳", "role_id": "old"},
+                {"nickname": "君墨", "role_id": "slil"},
+            ]
+        })
+        view.search_map = candidates or {}
+        view.newest_map = newest or {}
+
+        async def fake_search(session, alias, limit=10):
+            return view.search_map.get(alias, [])
+
+        async def fake_newest(session, role_id, server):
+            return view.newest_map.get(role_id)
+
+        view._public_search_rows = fake_search  # type: ignore[assignment]
+        view._role_newest_ms = fake_newest  # type: ignore[assignment]
+        return view
+
+    def run_async(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_retarget_rewrites_only_matching_rows(self):
+        view = self.make()
+        self.assertTrue(view._retarget_mapping("old", "new"))
+        pairs = [(r["nickname"], r["role_id"]) for r in view.config["nickname_mappings"]]
+        self.assertEqual(pairs, [("lzn", "new"), ("睡不醒的某阳", "new"), ("君墨", "slil")])
+        self.assertIn("nickname_mappings", view.config.saved)
+        self.assertFalse(view._retarget_mapping("old", "new"))
+
+    def test_newer_namesake_wins_and_mapping_follows(self):
+        view = self.make(
+            candidates={
+                "lzn": [{"role_id": "new", "role_name": "lzn", "server": "163"}],
+                "睡不醒的某阳": [],
+            },
+            newest={"new": 2000.0},
+        )
+        row = self.run_async(view._maybe_switch_role(None, "old", "睡不醒的某阳", "163", 1000.0))
+        self.assertEqual(row["role_id"], "new")
+        self.assertTrue(all(r["role_id"] != "old" for r in view.config["nickname_mappings"]))
+
+    def test_older_namesake_is_ignored(self):
+        view = self.make(
+            candidates={"lzn": [{"role_id": "new", "role_name": "lzn"}]},
+            newest={"new": 500.0},
+        )
+        self.assertIsNone(self.run_async(view._maybe_switch_role(None, "old", "lzn", "163", 1000.0)))
+
+    def test_different_name_is_not_treated_as_rename(self):
+        view = self.make(
+            candidates={"lzn": [{"role_id": "other", "role_name": "lzn3"}]},
+            newest={"other": 9999.0},
+        )
+        self.assertIsNone(self.run_async(view._maybe_switch_role(None, "old", "lzn", "163", 1000.0)))
+
+    def test_current_role_is_skipped(self):
+        view = self.make(
+            candidates={"lzn": [{"role_id": "old", "role_name": "lzn"}]},
+            newest={"old": 9999.0},
+        )
+        self.assertIsNone(self.run_async(view._maybe_switch_role(None, "old", "lzn", "163", 1000.0)))
 
 
 if __name__ == "__main__":
