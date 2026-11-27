@@ -1,3 +1,20 @@
+## 1.9.17
+
+### 优化
+
+- 微信改成「原图直发」：守护进程升级到 3.x 后支持 `imageQuality: "original"`，图片会**逐字节原样**发出去
+  （`sourcePreserved=true`、尺寸与 sha256 都不变）。插件因此在微信侧默认**不再切页、不再压进 65,200 字节预算**，
+  整张长图一条消息发完，字不再被反复重编码出毛刺。
+- 新增配置 `image_wechat_original`（默认开）：关掉就回到「按预算切页 + JPEG 重编码」的旧做法，
+  给还在旧守护进程（< 3.0.0）的部署兜底；适配器侧也会在守护进程不认这个字段时自动回退标准发送。
+- 原图模式先把长图编码成 **JPEG q92** 再发：实测守护进程只对「JPEG 源」逐字节原样转发（`sourcePreserved=true`、sha256 一致），PNG 会被它转一次码（尺寸不变但字节变了）。新增配置 `image_wechat_jpeg_quality`（默认 92）。
+- `image_send_mode` / `image_split_height` / `image_wechat_budget` / `image_crisp` 的说明按新行为重写。
+
+### 测试
+
+- `test_wechat_original_mode_keeps_single_full_height_png`：微信原图模式下一张 1080×2400 的长图只产出一页、高度不变。
+- `test_original_mode_off_restores_splitting`、`test_original_mode_string_false_disables`：关掉开关后恢复切页逻辑（含字符串 `off`）。
+
 ## 1.9.16
 
 ### 优化

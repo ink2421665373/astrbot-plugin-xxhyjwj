@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 from report_image import FONT_PATH, WIDTH, _blocks, _wrap, render_report_images
 from delivery import (
     WECHAT_IMAGE_BUDGET_BYTES,
+    encode_jpeg,
     encode_jpeg_within_budget,
     save_originals,
     slice_poster,
@@ -87,7 +88,7 @@ class ReportImageTests(unittest.TestCase):
     def plugin(self, config):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
         source = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_body" for f in n.body))
-        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_split_height", "_image_pages", "_image_budget")]
+        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_original_mode", "_image_jpeg_quality", "_image_split_height", "_image_pages", "_image_budget")]
         cls = ast.ClassDef(name="Plugin", bases=[], keywords=[], body=methods, decorator_list=[])
         components = SimpleNamespace(Reply=lambda **kw: ("reply", kw), Plain=lambda text: ("plain", text),
                                      Image=SimpleNamespace(fromBytes=lambda image: ("image", image)),
@@ -95,7 +96,7 @@ class ReportImageTests(unittest.TestCase):
         env = dict(asyncio=asyncio, base64=base64, AstrMessageEvent=object, Comp=components,
                    render_report_images=lambda text: [b"png"], logger=logging.getLogger(__name__),
                    split_message=split_message, save_originals=save_originals, slice_poster=slice_poster,
-                   encode_jpeg_within_budget=encode_jpeg_within_budget,
+                   encode_jpeg=encode_jpeg, encode_jpeg_within_budget=encode_jpeg_within_budget,
                    WECHAT_IMAGE_BUDGET_BYTES=WECHAT_IMAGE_BUDGET_BYTES)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
         plugin = env["Plugin"]()
@@ -219,12 +220,47 @@ class ReportImageTests(unittest.TestCase):
     def test_auto_mode_sends_inline_image_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
         self.assertEqual(plugin._image_send_mode(self.wechat_event()), "内嵌图片")
-        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
+        # 默认走「原图直发」：微信不切页、不重编码
+        self.assertTrue(plugin._image_original_mode(self.wechat_event()))
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 0)
         self.assertEqual(plugin._image_split_height(self.event()), 0)
+        self.assertFalse(plugin._image_original_mode(self.event()))
         event = self.wechat_event()
         result = asyncio.run(plugin._body(event, "完整报告"))
         self.assertEqual(result, [("image", b"png")])
         event.send.assert_not_awaited()
+
+    def test_wechat_original_mode_keeps_single_full_height_jpeg(self):
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        tall = Image.new("RGB", (1080, 2400), "#ffffff")
+        ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
+        buffer = BytesIO()
+        tall.save(buffer, format="PNG")
+        env["render_report_images"] = lambda text: [buffer.getvalue()]
+        pages = plugin._image_pages(self.wechat_event(), [buffer.getvalue()])
+        self.assertEqual(len(pages), 1)
+        # 守护进程只对 JPEG 源逐字节原样转发，所以原图模式要先编码成 JPEG
+        self.assertTrue(pages[0].startswith(b"\xff\xd8"))
+        with Image.open(BytesIO(pages[0])) as image:
+            self.assertEqual(image.size, (1080, 2400))
+
+    def test_wechat_jpeg_quality_is_configurable(self):
+        plugin, _ = self.plugin(dict(image_wechat_jpeg_quality=70))
+        self.assertEqual(plugin._image_jpeg_quality(), 70)
+        plugin, _ = self.plugin(dict(image_wechat_jpeg_quality="bad"))
+        self.assertEqual(plugin._image_jpeg_quality(), 92)
+        plugin, _ = self.plugin(dict(image_wechat_jpeg_quality=200))
+        self.assertEqual(plugin._image_jpeg_quality(), 100)
+
+    def test_original_mode_off_restores_splitting(self):
+        plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                     image_wechat_original=False, image_split_height=900))
+        self.assertFalse(plugin._image_original_mode(self.wechat_event()))
+        self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
+
+    def test_original_mode_string_false_disables(self):
+        plugin, _ = self.plugin(dict(image_wechat_original="off"))
+        self.assertFalse(plugin._image_original_mode(self.wechat_event()))
 
     def test_explicit_file_mode_still_sends_file_on_wechat(self):
         plugin, _ = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
@@ -241,6 +277,7 @@ class ReportImageTests(unittest.TestCase):
 
     def test_wechat_inline_mode_still_splits(self):
         plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                       image_wechat_original=False,
                                        image_split_height=900, image_send_mode="内嵌图片"))
         self.assertEqual(plugin._image_split_height(self.wechat_event()), 900)
         tall = Image.new("RGB", (1080, 2400), "#f2efe7")
@@ -285,8 +322,9 @@ class ReportImageTests(unittest.TestCase):
         self.assertEqual(plugin._image_send_mode(self.event()), "内嵌图片")
 
     def test_wechat_pages_are_jpeg_within_daemon_budget(self):
-        """守护进程只原样转发 ≤65,520 字节的 JPEG，超了就缩图降质。"""
+        """旧守护进程只原样转发 ≤65,520 字节的 JPEG，超了就缩图降质。"""
         plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                       image_wechat_original=False,
                                        image_send_mode="内嵌图片"))
         tall = Image.new("RGB", (1080, 2400), "#ffffff")
         draw = ImageDraw.Draw(tall)

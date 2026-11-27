@@ -118,6 +118,30 @@ def slice_poster(image: bytes, max_height: int, *, min_height_ratio: float = 0.7
 WECHAT_IMAGE_BUDGET_BYTES = 65200
 
 
+def encode_jpeg(image: bytes, quality: int = 92) -> bytes | None:
+    """把一张图整张编码成高质量 JPEG（不缩放、不降质迭代）。
+
+    守护进程（≥3.0.0）在 ``imageQuality=original`` 下只会把「JPEG 源」逐字节原样
+    转发；PNG 会被它转一次码（尺寸不变、字节变了）。所以微信原图模式先把长图编码
+    成 q92 JPEG，发出的字节和微信里看到的完全一致。
+    """
+    try:
+        quality = int(quality)
+    except (TypeError, ValueError):
+        quality = 92
+    quality = max(40, min(quality, 100))
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image)) as source:
+            canvas = source.convert("RGB")
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="JPEG", quality=quality, optimize=True, subsampling=0)
+        return buffer.getvalue()
+    except (OSError, ValueError):
+        return None
+
+
 def encode_jpeg_within_budget(image: bytes, max_bytes: int = WECHAT_IMAGE_BUDGET_BYTES,
                               *, min_quality: int = 45) -> bytes | None:
     """把一张图编码成不超过 max_bytes 的 JPEG；同尺寸压不进预算时等比缩小重试。

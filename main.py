@@ -34,6 +34,7 @@ from .ai_analysis import AIAnalysisMixin, build_analysis_data
 from .delivery import (
     WECHAT_IMAGE_BUDGET_BYTES,
     QueryProgress,
+    encode_jpeg,
     encode_jpeg_within_budget,
     save_originals,
     slice_poster,
@@ -193,7 +194,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.16")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.17")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -567,6 +568,26 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             return "两者都发"
         return "内嵌图片"
 
+    def _image_original_mode(self, event: AstrMessageEvent | None = None) -> bool:
+        """微信是否走「原图逐字节发送」（守护进程 ≥3.0.0 的 imageQuality=original）。
+
+        打开后不再切页、也不再压进 65,200 字节预算：整张长图原样发出去，文字不会
+        被 JPEG 反复重编码出毛刺。守护进程不支持时由适配器自动回退到压缩发送。
+        """
+        raw = self.config.get("image_wechat_original", True)
+        if isinstance(raw, str):
+            if raw.strip().lower() in ("false", "0", "no", "off", ""):
+                return False
+        elif raw is False:
+            return False
+        name = ""
+        if event is not None:
+            try:
+                name = str(event.get_platform_name() or "").lower()
+            except (AttributeError, TypeError):
+                name = ""
+        return "wechat" in name
+
     def _image_split_height(self, event: AstrMessageEvent | None = None) -> int:
         """微信平台按高度切页，默认 900。
 
@@ -582,6 +603,8 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             except (AttributeError, TypeError):
                 name = ""
         if "wechat" not in name:
+            return 0
+        if self._image_original_mode(event):
             return 0
         raw = self.config.get("image_split_height", 900)
         try:
@@ -603,8 +626,32 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             return 0
         return max(20000, min(value, 5_000_000))
 
+    def _image_jpeg_quality(self) -> int:
+        """微信原图模式的 JPEG 质量，默认 92（守护进程对 JPEG 源逐字节原样转发）。"""
+        raw = self.config.get("image_wechat_jpeg_quality", 92)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 92
+        return max(40, min(value, 100))
+
     def _image_pages(self, event: AstrMessageEvent | None, images: list[bytes]) -> list[bytes]:
-        """把长图切成多页，微信再压进守护进程的「原样转发」预算（JPEG）。"""
+        """把长图切成多页，微信再压进守护进程的「原样转发」预算（JPEG）。
+
+        微信 + 原图模式：整张图编码成高质量 JPEG 后原样发出——守护进程对 JPEG 源
+        在 ``imageQuality=original`` 下逐字节转发（实测 sourcePreserved=true、sha256
+        一致），既不切页也不再压预算，中文细笔画不会出毛刺。
+        """
+        if self._image_original_mode(event):
+            quality = self._image_jpeg_quality()
+            packed: list[bytes] = []
+            for image in images:
+                try:
+                    jpeg = encode_jpeg(image, quality)
+                except (OSError, ValueError):
+                    jpeg = None
+                packed.append(jpeg or image)
+            return packed or images
         height = self._image_split_height(event)
         if height <= 0:
             return images
