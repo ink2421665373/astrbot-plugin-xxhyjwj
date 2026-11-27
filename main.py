@@ -179,6 +179,24 @@ def _choose_season(options: object, requested: str, mappings: object = None) -> 
     return match[0], match[1]
 
 
+def _latest_season(options: object) -> tuple[str, str] | None:
+    """没有指定赛季时的默认值：取接口列表里最新的一档赛季。
+
+    接口顺序与赛季上线顺序一致（先行者 → 浪潮 → … → 千机 → 吞天），最后一档即最新赛季；
+    `pre-01`（全部赛季）永远跳过。接口的 `is_current` 曾把已结束的千机标为当前，
+    所以这里不采信该标记。
+    """
+    entries = merge_season_options(options, None)
+    rest = [
+        (str(item.get("key") or ""), str(item.get("value") or ""))
+        for item in entries
+        if item.get("key") and str(item.get("key")) != "pre-01"
+    ]
+    if not rest:
+        return None
+    return rest[-1]
+
+
 def _configured_season(mappings: object) -> tuple[str, str] | None:
     """Resolve a saved scope before any query request; reject invalid settings."""
     if any(item.get("_manual_current") for item in merge_season_options([], mappings)):
@@ -201,7 +219,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.20")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.21")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1534,8 +1552,13 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
         """只读查询：定位角色 → 更新 → 取列表 → 取详情 → 出报告。"""
         queried_at = time.time()
         configured_season = _configured_season(self.config.get("season_mappings", []))
-        list_season = configured_season[0] if configured_season else "pre-01"
-        recent_season_name = configured_season[1] if configured_season else "全部赛季"
+        if configured_season:
+            list_season, recent_season_name = configured_season
+        else:
+            # 没勾选赛季 → 默认查最新赛季（不再退回全部赛季）
+            list_season, recent_season_name = _latest_season(
+                self.config.get("season_mappings", [])
+            ) or ("pre-01", "全部赛季")
         if progress:
             await progress("正在搜索玩家并确认角色…" + ("（本次强制刷新详情缓存）" if force_refresh else ""), force=True)
         detail_mode = self._detail_query_mode()
@@ -1726,14 +1749,14 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                         if isinstance(item, dict) and item.get("hero_id") and item.get("name")
                     })
                     if configured_season is None:
-                        try:
-                            season_key, season_name = _choose_season(home.get("seasons"), "当前")
-                        except ValueError as exc:
-                            # Only automatic detection may reuse all-season data.
+                        picked = _latest_season(home.get("seasons")) or _latest_season(
+                            self.config.get("season_mappings", [])
+                        )
+                        if picked:
+                            season_key, season_name = picked
+                        else:
                             season_key, season_name = "pre-01", "全部赛季"
-                            if not detailed:
-                                season_notice = "未能确认当前赛季，以下展示接口返回的全部赛季数据，不能当作当前赛季统计。"
-                            logger.warning("[naraka] current season unavailable; using all seasons: %s", exc)
+                            logger.warning("[naraka] 接口没有可用赛季，概览退回全部赛季")
                 except (HeyboxError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                     logger.warning(f"[naraka] season catalog detection failed: {type(exc).__name__}")
                     if configured_season:
@@ -2021,7 +2044,20 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
                     for chunk in _split_lines(lines):
                         yield self._note(event, chunk)
                     return
-                season_key, season_name = configured_season or _choose_season(home.get("seasons"), season, self.config.get("season_mappings", []))
+                if configured_season:
+                    season_key, season_name = configured_season
+                else:
+                    try:
+                        season_key, season_name = _choose_season(
+                            home.get("seasons"), season, self.config.get("season_mappings", [])
+                        )
+                    except ValueError as exc:
+                        picked = _latest_season(home.get("seasons")) if season in ("当前", "") else None
+                        if not picked:
+                            raise
+                        season_key, season_name = picked
+                        fallback_notice = f"{exc}（已改用最新赛季「{picked[1]}」）"
+                        logger.warning("[naraka] 接口未标明当前赛季，改用最新赛季: %s", exc)
                 if season_key == initial_season:
                     body = home
                 else:

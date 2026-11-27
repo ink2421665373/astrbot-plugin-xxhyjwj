@@ -31,22 +31,22 @@ class ReportDataFallbackTests(unittest.TestCase):
             result, calls = fixture.run_query(mode="天选三排", pool_rows=rows, pre_body=body, options=options,
                                              pool_requests=requests, for_ai=True)
         text = result.report_text
-        for value in ("全部赛季概览｜全部赛季｜天选三排", "分数：3796", "总场次：103", "场均伤害：11357",
-                      "不能当作当前赛季统计", "选中对局：0", "本次列表模式分布为 天选双排30场"):
+        for value in ("当前赛季概览｜千机赛季｜天选三排", "分数：3200", "选中对局：0",
+                      "本次列表模式分布为 天选双排30场"):
             self.assertIn(value, text)
-        self.assertNotIn("当前赛季概览", text)
+        self.assertNotIn("未能确认当前赛季", text)
         self.assertNotIn("赛季未知", text)
         self.assertEqual(requests, [dict(battle_tid="5000001", season="pre-01")])
         self.assertEqual(calls.count(("5000001", "pre-01")), 1)
-        self.assertTrue(all(season == "pre-01" for _, season in calls))
-        self.assertEqual(result.analysis_data["season"]["name"], "全部赛季")
+        self.assertIn(("5000001", "qianji"), calls)
+        self.assertEqual(result.analysis_data["season"]["name"], "千机赛季")
         self.assertEqual(result.analysis_data["season"]["error"], "")
-        self.assertIn("不能当作当前赛季统计", result.analysis_data["season"]["notice"])
+        self.assertEqual(result.analysis_data["season"]["notice"], "")
         self.assertEqual(result.analysis_data["query_context"]["mode_counts"], {"天选双排": 30})
         ai = importlib.import_module("naraka_test_package.ai_analysis")
         payload = json.loads(ai.analysis_prompt(result.analysis_data).split("\n")[-1])
         self.assertTrue(ai.has_season_data(result.analysis_data))
-        self.assertIn("仅依据全部赛季概览", payload["analysis_scope"])
+        self.assertIn("仅依据千机赛季概览", payload["analysis_scope"])
         self.assertEqual(payload["selected"], 0)
 
     def test_fallback_image_keeps_stats_and_labels_without_claiming_current_score(self):
@@ -63,8 +63,9 @@ class ReportDataFallbackTests(unittest.TestCase):
             pages = render_report_images(result.texts[0])
         self.assertEqual(len(pages), 1)
         drawn = "".join(captured)
-        for expected in ("全部赛季概览", "11357", "3796", "不能当作当前赛季统计"):
+        for expected in ("全部赛季概览", "11357", "3796"):
             self.assertIn(expected, drawn)
+        self.assertNotIn("当前赛季概览", drawn)
         self.assertNotIn("当前分数", drawn)
 
     def test_all_explicit_mode_aliases_are_sent_to_the_list_request(self):

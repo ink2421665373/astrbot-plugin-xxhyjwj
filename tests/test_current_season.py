@@ -62,7 +62,7 @@ class CurrentSeasonTests(unittest.TestCase):
                   force_refresh=False, detail_mode="全部关闭", cache=None, detail_failure=False, progress=None, for_ai=False,
                   pool_requests=None, respect_requested_mode=False, home_error=None, pool_error=None, on_pool=None):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
-        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_choose_season", "_configured_season", "_split_lines", "_has_value", "_is_rate_limited", "_must_stop_after_error")]
+        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_choose_season", "_latest_season", "_configured_season", "_split_lines", "_has_value", "_is_rate_limited", "_must_stop_after_error")]
         plugin = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_run_read" for f in n.body))
         functions.extend(f for f in plugin.body if getattr(f, "name", "") in ("_run_read", "_season_report"))
         env = dict(globals(), _ReadResult=lambda **kw: SimpleNamespace(**kw), DEFAULT_SERVER="163", HeyboxError=ApiError, AstrMessageEvent=object,
@@ -506,14 +506,15 @@ class CurrentSeasonTests(unittest.TestCase):
         options.append(dict(key="verified-key", value="吞天赛季"))
         self.assertEqual(self.choose(options, "吞天"), ("verified-key", "吞天赛季"))
 
-    def test_missing_current_keeps_recent_stats_without_requesting_guessed_id(self):
+    def test_missing_current_defaults_to_latest_season(self):
         result, calls = self.run_query(options=[dict(key="qj", value="千机赛季", selected=True)])
         text = "\n".join(result.texts)
-        self.assertIn("未能确认当前赛季", text)
-        self.assertIn("全部赛季概览", text)
+        # 没有勾选赛季时默认用最新赛季，不再退回全部赛季，也不再提示「未能确认当前赛季」。
+        self.assertIn("当前赛季概览｜千机赛季", text)
+        self.assertNotIn("未能确认当前赛季", text)
         self.assertIn("最近1场场均伤害：100.0", text)
         self.assertEqual(calls.count(("12", "pre-01")), 1)
-        self.assertTrue(all(code == "pre-01" for _, code in calls))
+        self.assertIn(("12", "qj"), calls)
 
     def test_listing_command_shows_full_catalog_without_fetching_stats(self):
         options = [dict(key=f"s{i}", value=f"赛季{i}", selected="false") for i in range(40)]
@@ -542,8 +543,8 @@ class CurrentSeasonTests(unittest.TestCase):
     def test_missing_season_never_labels_all_seasons_as_current(self):
         result, calls = self.run_query(missing=True)
         text = "\n".join(result.texts)
+        # 接口一个赛季都没返回时，只能退回全部赛季，且不能自称「当前赛季」。
         self.assertIn("全部赛季概览", text)
-        self.assertIn("未能确认当前赛季", text)
         self.assertNotIn("当前赛季概览", text)
         self.assertEqual(calls.count(("12", "pre-01")), 1)
         self.assertTrue(all(code == "pre-01" for _, code in calls))

@@ -223,9 +223,11 @@ class MappingViewTests(unittest.TestCase):
         self.assertEqual(status, 200)
         with patch("time.time", return_value=1793055600):
             result, calls = fixture.run_query(options=options, config=self.config)
-        self.assertNotIn(("12", "qianji"), calls)
-        self.assertIn("全部赛季概览", result.report_text)
-        self.assertIn("未能确认当前赛季", result.report_text)
+        # 自动模式下没有手动赛季 → 默认查接口里最新的赛季（qianji）。
+        self.assertIn(("12", "qianji"), calls)
+        self.assertIn("当前赛季概览｜千机赛季", result.report_text)
+        self.assertNotIn("全部赛季概览", result.report_text)
+        self.assertNotIn("未能确认当前赛季", result.report_text)
         with patch("time.time", return_value=1793055600), self.assertRaisesRegex(ValueError, "千机赛季标为当前"):
             fixture.choose(options, "当前", self.config["season_mappings"])
 
