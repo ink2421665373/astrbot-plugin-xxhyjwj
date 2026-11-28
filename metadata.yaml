@@ -1,6 +1,6 @@
 ﻿name: astrbot_plugin_naraka
 desc: 通过小黑盒查询永劫无间端游近期战绩与单局详情，支持昵称搜索、模式筛选、三种数据模式、自动绑定兜底与可选AI战绩评价。
-version: 1.9.21
+version: 1.9.22
 author: as124da1231
 repo: "https://github.com/ink2421665373/astrbot-plugin-xxhyjwj"
 display_name: 永劫无间战绩查询

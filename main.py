@@ -36,6 +36,7 @@ from .delivery import (
     QueryProgress,
     encode_jpeg,
     encode_jpeg_within_budget,
+    resize_image,
     save_originals,
     slice_poster,
     split_message,
@@ -219,7 +220,7 @@ class _ReadResult:
     analysis_data: dict = field(default_factory=dict)
 
 
-@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.21")
+@register(PLUGIN, "as124da1231", "永劫无间端游战绩查询", "1.9.22")
 class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -896,13 +897,43 @@ class NarakaPlugin(NarakaToolMixin, AIAnalysisMixin, MappingViewMixin, Star):
             return 92
         return max(40, min(value, 100))
 
+    def _image_render_width(self, event: AstrMessageEvent | None = None) -> int:
+        """发出前把渲染图等比缩到多宽，默认 900（0 = 保持 1080 原样）。
+
+        微信聊天里先给的是它自己生成的预览图，预览预算固定在 34KB 上下（实测
+        1080×2363 → 33,959 字节，756×1654 → 34,096 字节），和源图字节数无关。
+        像素越少，同样预算下每个字的码字越多：1080 宽需要 JPEG q2 才能压进 30KB，
+        900 宽能到 q5，字缘明显干净。想保留 1080 原始精度就把这项设成 0。
+        """
+        raw = self.config.get("image_render_width", 900)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 900
+        if value <= 0:
+            return 0
+        return max(480, min(value, 2160))
+
     def _image_pages(self, event: AstrMessageEvent | None, images: list[bytes]) -> list[bytes]:
         """把长图切成多页，微信再压进守护进程的「原样转发」预算（JPEG）。
 
         微信 + 原图模式：整张图编码成高质量 JPEG 后原样发出——守护进程对 JPEG 源
         在 ``imageQuality=original`` 下逐字节转发（实测 sourcePreserved=true、sha256
         一致），既不切页也不再压预算，中文细笔画不会出毛刺。
+
+        无论哪种模式，先按 ``image_render_width`` 等比缩放：微信预览的字节预算固定，
+        像素越少预览越清楚。
         """
+        width = self._image_render_width(event)
+        if width > 0:
+            shrunk: list[bytes] = []
+            for image in images:
+                try:
+                    resized = resize_image(image, width)
+                except (OSError, ValueError):
+                    resized = None
+                shrunk.append(resized or image)
+            images = shrunk
         if self._image_original_mode(event):
             quality = self._image_jpeg_quality()
             packed: list[bytes] = []

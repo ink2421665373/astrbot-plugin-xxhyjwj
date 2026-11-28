@@ -142,6 +142,38 @@ def encode_jpeg(image: bytes, quality: int = 92) -> bytes | None:
         return None
 
 
+def resize_image(image: bytes, width: int) -> bytes | None:
+    """把整张长图等比缩到指定宽度，返回 PNG 字节；``width <= 0`` 或解码失败返回 None。
+
+    微信聊天里先显示的是它自己生成的预览图，而预览的字节预算固定在 34KB 左右
+    （实测 1080×2363 与 756×1654 的预览分别是 33,959 / 34,096 字节）。像素越少，
+    同样的预算能分给每个字的码字就越多——渲染宽度从 1080 降到 900 后，预览从
+    「JPEG q2」涨到「q5」，字缘明显干净。
+    """
+    try:
+        width = int(width)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0:
+        return None
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image)) as source:
+            canvas = source.convert("RGB")
+            if canvas.width <= width:
+                buffer = io.BytesIO()
+                canvas.save(buffer, format="PNG")
+                return buffer.getvalue()
+            height = max(1, round(canvas.height * width / canvas.width))
+            canvas = canvas.resize((width, height), Image.LANCZOS)
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        return buffer.getvalue()
+    except (OSError, ValueError):
+        return None
+
+
 def encode_jpeg_within_budget(image: bytes, max_bytes: int = WECHAT_IMAGE_BUDGET_BYTES,
                               *, min_quality: int = 45) -> bytes | None:
     """把一张图编码成不超过 max_bytes 的 JPEG；同尺寸压不进预算时等比缩小重试。

@@ -18,6 +18,7 @@ from delivery import (
     WECHAT_IMAGE_BUDGET_BYTES,
     encode_jpeg,
     encode_jpeg_within_budget,
+    resize_image,
     save_originals,
     slice_poster,
     split_message,
@@ -88,7 +89,7 @@ class ReportImageTests(unittest.TestCase):
     def plugin(self, config):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8-sig"))
         source = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(getattr(f, "name", "") == "_body" for f in n.body))
-        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_original_mode", "_image_jpeg_quality", "_image_split_height", "_image_pages", "_image_budget")]
+        methods = [f for f in source.body if getattr(f, "name", "") in ("_body", "_reply", "_message_id", "_send_at", "result_method", "_send_text_fallback", "_send_original_images", "_image_send_mode", "_image_original_mode", "_image_jpeg_quality", "_image_split_height", "_image_pages", "_image_budget", "_image_render_width")]
         cls = ast.ClassDef(name="Plugin", bases=[], keywords=[], body=methods, decorator_list=[])
         components = SimpleNamespace(Reply=lambda **kw: ("reply", kw), Plain=lambda text: ("plain", text),
                                      Image=SimpleNamespace(fromBytes=lambda image: ("image", image)),
@@ -97,6 +98,7 @@ class ReportImageTests(unittest.TestCase):
                    render_report_images=lambda text: [b"png"], logger=logging.getLogger(__name__),
                    split_message=split_message, save_originals=save_originals, slice_poster=slice_poster,
                    encode_jpeg=encode_jpeg, encode_jpeg_within_budget=encode_jpeg_within_budget,
+                   resize_image=resize_image,
                    WECHAT_IMAGE_BUDGET_BYTES=WECHAT_IMAGE_BUDGET_BYTES)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "main.py", "exec"), env)
         plugin = env["Plugin"]()
@@ -231,7 +233,8 @@ class ReportImageTests(unittest.TestCase):
         event.send.assert_not_awaited()
 
     def test_wechat_original_mode_keeps_single_full_height_jpeg(self):
-        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
+                                       image_render_width=0))
         tall = Image.new("RGB", (1080, 2400), "#ffffff")
         ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
         buffer = BytesIO()
@@ -242,6 +245,42 @@ class ReportImageTests(unittest.TestCase):
         # 守护进程只对 JPEG 源逐字节原样转发，所以原图模式要先编码成 JPEG
         self.assertTrue(pages[0].startswith(b"\xff\xd8"))
         with Image.open(BytesIO(pages[0])) as image:
+            self.assertEqual(image.size, (1080, 2400))
+
+    def test_wechat_render_width_defaults_to_900(self):
+        plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain"))
+        self.assertEqual(plugin._image_render_width(self.wechat_event()), 900)
+        tall = Image.new("RGB", (1080, 2400), "#ffffff")
+        ImageDraw.Draw(tall).text((80, 80), "长图", fill="#252722")
+        buffer = BytesIO()
+        tall.save(buffer, format="PNG")
+        pages = plugin._image_pages(self.wechat_event(), [buffer.getvalue()])
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(pages[0].startswith(b"\xff\xd8"))
+        with Image.open(BytesIO(pages[0])) as image:
+            self.assertEqual(image.size, (900, 2000))
+
+    def test_render_width_tolerates_bad_values(self):
+        plugin, _ = self.plugin(dict(image_render_width="bad"))
+        self.assertEqual(plugin._image_render_width(self.event()), 900)
+        plugin, _ = self.plugin(dict(image_render_width=10))
+        self.assertEqual(plugin._image_render_width(self.event()), 480)
+        plugin, _ = self.plugin(dict(image_render_width=99999))
+        self.assertEqual(plugin._image_render_width(self.event()), 2160)
+        plugin, _ = self.plugin(dict(image_render_width=0))
+        self.assertEqual(plugin._image_render_width(self.event()), 0)
+
+    def test_resize_image_keeps_aspect_and_skips_bad_input(self):
+        tall = Image.new("RGB", (1080, 2400), "#ffffff")
+        buffer = BytesIO()
+        tall.save(buffer, format="PNG")
+        shrunk = resize_image(buffer.getvalue(), 900)
+        with Image.open(BytesIO(shrunk)) as image:
+            self.assertEqual(image.size, (900, 2000))
+        self.assertIsNone(resize_image(buffer.getvalue(), 0))
+        self.assertIsNone(resize_image(b"not an image", 900))
+        wide = resize_image(buffer.getvalue(), 1440)
+        with Image.open(BytesIO(wide)) as image:
             self.assertEqual(image.size, (1080, 2400))
 
     def test_wechat_jpeg_quality_is_configurable(self):
@@ -325,6 +364,7 @@ class ReportImageTests(unittest.TestCase):
         """旧守护进程只原样转发 ≤65,520 字节的 JPEG，超了就缩图降质。"""
         plugin, env = self.plugin(dict(result_display_format="图片", result_reply_method="plain",
                                        image_wechat_original=False,
+                                       image_render_width=0,
                                        image_send_mode="内嵌图片"))
         tall = Image.new("RGB", (1080, 2400), "#ffffff")
         draw = ImageDraw.Draw(tall)
